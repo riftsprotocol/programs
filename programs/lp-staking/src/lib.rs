@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Mint, Transfer, MintTo};
 
-declare_id!("LPStake111111111111111111111111111111111111");
+declare_id!("4kQhF3BfLPRXVN4m3YpZHrG4T5X3ZPk3JUj2L8TdN7W2");
 
 #[program]
 pub mod lp_staking {
