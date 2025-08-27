@@ -1,0 +1,34 @@
+[toolchain]
+anchor_version = "0.29.0"
+solana_version = "1.18.26"
+sbf_tools = true
+
+[features]
+seeds = false
+skip-lint = false
+
+[programs.localnet]
+rifts_protocol = "8FX1CVcR4QZyvTYtV6rG42Ha1K2qyRNykKYcwVctspUh"
+fee_collector = "B8QoBZH3jDcyQueDVj8K8nBxKssHdzWiYeP4HJXRtcRR"
+governance = "7rYo4k9xGmQU7zkQEBqjfBU1y9hkQnRFtFbpn23dZNQR"
+lp_staking = "4kQhF3BfLPRXVN4m3YpZHrG4T5X3ZPk3JUj2L8TdN7W2"
+
+[programs.devnet]
+rifts_protocol = "8FX1CVcR4QZyvTYtV6rG42Ha1K2qyRNykKYcwVctspUh"
+fee_collector = "B8QoBZH3jDcyQueDVj8K8nBxKssHdzWiYeP4HJXRtcRR"
+governance = "7rYo4k9xGmQU7zkQEBqjfBU1y9hkQnRFtFbpn23dZNQR"
+lp_staking = "4kQhF3BfLPRXVN4m3YpZHrG4T5X3ZPk3JUj2L8TdN7W2"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "devnet"
+wallet = "./deployment-keypair.json"
+
+[scripts]
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+
+[build]
+skip-idl = true
+target-dir = "C:/tmp/target"
