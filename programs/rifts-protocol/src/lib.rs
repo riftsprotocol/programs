@@ -367,11 +367,14 @@ pub mod rifts_protocol {
         rift.lp_token_supply = lp_supply;
         
         // Create Meteora-compatible pool PDA (same seed structure as Meteora)
+        let underlying_key = ctx.accounts.underlying_mint.key();
+        let rift_key = ctx.accounts.rift_mint.key();
+        let fee_bytes = trading_fee_bps.to_le_bytes();
         let meteora_pool_seeds = &[
             b"lb_pair",
-            ctx.accounts.underlying_mint.key().as_ref(),
-            ctx.accounts.rift_mint.key().as_ref(),
-            &trading_fee_bps.to_le_bytes(),
+            underlying_key.as_ref(),
+            rift_key.as_ref(),
+            &fee_bytes,
         ];
         let (meteora_pool_pda, _) = Pubkey::find_program_address(meteora_pool_seeds, &crate::ID);
         rift.liquidity_pool = Some(meteora_pool_pda);
@@ -1031,6 +1034,14 @@ pub mod rifts_protocol {
     ) -> Result<()> {
         let rift = &mut ctx.accounts.rift;
         
+        // Validate Jupiter program ID (Jupiter V6: JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4)
+        let jupiter_v6_id = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".parse::<Pubkey>()
+            .map_err(|_| ErrorCode::InvalidProgramId)?;
+        require!(
+            ctx.accounts.jupiter_program.key() == jupiter_v6_id,
+            ErrorCode::InvalidProgramId
+        );
+        
         // Validate input
         require!(amount_in > 0, ErrorCode::InvalidAmount);
         require!(amount_in <= 1_000_000_000_000, ErrorCode::AmountTooLarge);
@@ -1553,6 +1564,9 @@ pub struct ProcessFeeDistribution<'info> {
     
     /// Fee collector program for CPI
     /// CHECK: This is the fee collector program ID
+    #[account(
+        constraint = fee_collector_program.key() == fee_collector::ID @ ErrorCode::InvalidProgramId
+    )]
     pub fee_collector_program: UncheckedAccount<'info>,
     
     /// RIFTS token mint for buyback operations
@@ -1586,6 +1600,9 @@ pub struct StakeLPTokensExternal<'info> {
     
     /// External LP staking program for CPI
     /// CHECK: LP staking program validation
+    #[account(
+        constraint = lp_staking_program.key() == lp_staking::ID @ ErrorCode::InvalidProgramId
+    )]
     pub lp_staking_program: UncheckedAccount<'info>,
     
     pub token_program: Program<'info, Token>,
@@ -1701,7 +1718,8 @@ pub struct JupiterSwapForBuyback<'info> {
     )]
     pub vault_authority: UncheckedAccount<'info>,
     
-    /// CHECK: Jupiter program
+    /// CHECK: Jupiter program - hardcoded Jupiter V6 program ID
+    /// Jupiter V6: JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4
     pub jupiter_program: UncheckedAccount<'info>,
 }
 
