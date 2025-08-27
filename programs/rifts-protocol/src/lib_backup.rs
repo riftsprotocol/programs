@@ -3,6 +3,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer, Mint, MintTo};
 // Note: Metadata functionality removed to avoid dependency issues
 use anchor_lang::solana_program::sysvar::rent::Rent;
+use anchor_lang::solana_program;
 
 // External program CPI imports
 pub use fee_collector;
@@ -96,15 +97,6 @@ pub mod rifts_protocol {
         rift.rifts_tokens_distributed = 0;
         rift.rifts_tokens_burned = 0;
         
-        // Initialize Meteora-style DLMM Pool (NEW)
-        rift.liquidity_pool = None;  // Will be set during first wrap
-        rift.lp_token_supply = 0;
-        rift.pool_trading_fee_bps = 30;  // Default 0.3% trading fee
-        rift.total_liquidity_underlying = 0;
-        rift.total_liquidity_rift = 0;
-        rift.active_bin_id = 0;      // Will be set during pool creation
-        rift.bin_step = 0;           // Will be set during pool creation
-        
         // Initialize LP staking
         rift.total_lp_staked = 0;
         rift.pending_rewards = 0;
@@ -195,15 +187,6 @@ pub mod rifts_protocol {
         rift.rifts_tokens_distributed = 0;
         rift.rifts_tokens_burned = 0;
         
-        // Initialize Meteora-style DLMM Pool (NEW)
-        rift.liquidity_pool = None;  // Will be set during first wrap
-        rift.lp_token_supply = 0;
-        rift.pool_trading_fee_bps = 30;  // Default 0.3% trading fee
-        rift.total_liquidity_underlying = 0;
-        rift.total_liquidity_rift = 0;
-        rift.active_bin_id = 0;      // Will be set during pool creation
-        rift.bin_step = 0;           // Will be set during pool creation
-        
         // Initialize LP staking
         rift.total_lp_staked = 0;
         rift.pending_rewards = 0;
@@ -233,13 +216,10 @@ pub mod rifts_protocol {
         Ok(())
     }
 
-    /// Wrap underlying tokens into rift tokens AND create tradeable pool
+    /// Wrap underlying tokens into rift tokens
     pub fn wrap_tokens(
         ctx: Context<WrapTokens>,
         amount: u64,
-        initial_rift_amount: u64,
-        trading_fee_bps: u16,
-        bin_step: u16,  // Let users choose Meteora bin step (fee tier)
     ) -> Result<()> {
         
         let rift = &mut ctx.accounts.rift;
@@ -277,47 +257,36 @@ pub mod rifts_protocol {
             .checked_sub(wrap_fee)
             .ok_or(ErrorCode::MathOverflow)?;
 
-        // Transfer underlying tokens to LP POOL (not vault)
+        // Transfer underlying tokens to vault
         // Validate program ID before CPI call
         require!(
             ctx.accounts.token_program.key() == anchor_spl::token::ID,
             ErrorCode::InvalidProgramId
-        );
-        require!(initial_rift_amount > 0, ErrorCode::InvalidAmount);
-        require!(trading_fee_bps <= 100, ErrorCode::InvalidTradingFee);
-        
-        // Validate Meteora bin step (fee tier) - common Meteora values
-        require!(
-            bin_step == 1 || bin_step == 5 || bin_step == 10 || bin_step == 25 || 
-            bin_step == 50 || bin_step == 100 || bin_step == 200 || bin_step == 500,
-            ErrorCode::InvalidBinStep
         );
         
         let transfer_ctx = CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
             Transfer {
                 from: ctx.accounts.user_underlying.to_account_info(),
-                to: ctx.accounts.pool_underlying.to_account_info(),
+                to: ctx.accounts.vault.to_account_info(),
                 authority: ctx.accounts.user.to_account_info(),
             },
         );
-        token::transfer(transfer_ctx, amount_after_fee)?; // Only amount after fee goes to pool
+        token::transfer(transfer_ctx, amount)?;
 
-        // Calculate rift tokens: user gets tokens + pool gets initial_rift_amount
-        let rift_tokens_to_user = amount_after_fee  // User gets 1:1 for wrapped amount
+        // **CRITICAL FIX**: Calculate rift tokens to mint with additional validation
+        // Backing ratio already validated above
+        let rift_tokens_to_mint = amount_after_fee
             .checked_mul(10000)
             .ok_or(ErrorCode::MathOverflow)?
             .checked_div(rift.backing_ratio)
             .ok_or(ErrorCode::MathOverflow)?;
         
-        require!(rift_tokens_to_user > 0, ErrorCode::MintAmountTooSmall);
-        require!(rift_tokens_to_user <= 1_000_000_000_000_000, ErrorCode::MintAmountTooLarge);
-        
-        let total_rift_to_mint = rift_tokens_to_user
-            .checked_add(initial_rift_amount)
-            .ok_or(ErrorCode::MathOverflow)?;
+        // **CRITICAL FIX**: Validate mint amount is reasonable
+        require!(rift_tokens_to_mint > 0, ErrorCode::MintAmountTooSmall);
+        require!(rift_tokens_to_mint <= 1_000_000_000_000_000, ErrorCode::MintAmountTooLarge);
 
-        // Mint rift tokens to user AND pool
+        // Mint rift tokens to user
         let rift_key = rift.key();
         let rift_mint_auth_seeds = &[
             b"rift_mint_auth",
@@ -326,8 +295,13 @@ pub mod rifts_protocol {
         ];
         let signer_seeds = &[&rift_mint_auth_seeds[..]];
 
-        // Mint tokens for user (wrapped tokens)
-        let mint_to_user_ctx = CpiContext::new_with_signer(
+        // Validate program ID before CPI call
+        require!(
+            ctx.accounts.token_program.key() == anchor_spl::token::ID,
+            ErrorCode::InvalidProgramId
+        );
+        
+        let mint_ctx = CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
             MintTo {
                 mint: ctx.accounts.rift_mint.to_account_info(),
@@ -336,78 +310,11 @@ pub mod rifts_protocol {
             },
             signer_seeds,
         );
-        token::mint_to(mint_to_user_ctx, rift_tokens_to_user)?;
-        
-        // Mint tokens for pool (for trading)
-        let mint_to_pool_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            MintTo {
-                mint: ctx.accounts.rift_mint.to_account_info(),
-                to: ctx.accounts.pool_rift_tokens.to_account_info(),
-                authority: ctx.accounts.rift_mint_authority.to_account_info(),
-            },
-            signer_seeds,
-        );
-        token::mint_to(mint_to_pool_ctx, initial_rift_amount)?;
-        
-        // Create Meteora-style DLMM pool with bins
-        rift.total_liquidity_underlying = amount_after_fee;
-        rift.total_liquidity_rift = initial_rift_amount;
-        rift.pool_trading_fee_bps = trading_fee_bps;
-        // Calculate LP token supply using geometric mean approximation
-        // Since we can't use sqrt on u128, we'll use a safe approximation
-        let product = (amount_after_fee as u128)
-            .checked_mul(initial_rift_amount as u128)
-            .ok_or(ErrorCode::MathOverflow)?;
-        // Simple integer square root approximation for LP tokens
-        let mut lp_supply = (product / 2) as u64;
-        if lp_supply == 0 {
-            lp_supply = 1; // Minimum LP supply
-        }
-        rift.lp_token_supply = lp_supply;
-        
-        // Create Meteora-compatible pool PDA (same seed structure as Meteora)
-        let meteora_pool_seeds = &[
-            b"lb_pair",
-            ctx.accounts.underlying_mint.key().as_ref(),
-            ctx.accounts.rift_mint.key().as_ref(),
-            &trading_fee_bps.to_le_bytes(),
-        ];
-        let (meteora_pool_pda, _) = Pubkey::find_program_address(meteora_pool_seeds, &crate::ID);
-        rift.liquidity_pool = Some(meteora_pool_pda);
-        
-        // Initialize DLMM-style bin structure (simplified)
-        rift.active_bin_id = 8388608; // 2^23, center bin like Meteora
-        rift.bin_step = match trading_fee_bps {
-            1..=10 => 1,    // Ultra-low fee pools
-            11..=25 => 5,   // Low fee pools  
-            26..=50 => 10,  // Medium fee pools
-            51..=100 => 25, // High fee pools
-            _ => 25,        // Default
-        };
-        
-        // Mint LP tokens to user as pool creator
-        let lp_mint_auth_seeds = &[
-            b"lp_mint_auth",
-            rift_key.as_ref(),
-            &[ctx.bumps.lp_mint_authority],
-        ];
-        let lp_signer_seeds = &[&lp_mint_auth_seeds[..]];
-        
-        let mint_lp_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            MintTo {
-                mint: ctx.accounts.lp_mint.to_account_info(),
-                to: ctx.accounts.user_lp_tokens.to_account_info(),
-                authority: ctx.accounts.lp_mint_authority.to_account_info(),
-            },
-            lp_signer_seeds,
-        );
-        token::mint_to(mint_lp_ctx, rift.lp_token_supply)?;
+        token::mint_to(mint_ctx, rift_tokens_to_mint)?;
 
-        // Update rift state with checked arithmetic (tracks wrapped amount)
+        // Update rift state with checked arithmetic
         rift.total_wrapped = rift.total_wrapped
-            .checked_add(rift_tokens_to_user)  // Track user's wrapped tokens
+            .checked_add(amount_after_fee)
             .ok_or(ErrorCode::MathOverflow)?;
         
         // Track fees collected with checked arithmetic
@@ -431,16 +338,12 @@ pub mod rifts_protocol {
         // **CRITICAL FIX**: Clear reentrancy guard at the end
         rift.reentrancy_guard = false;
 
-        emit!(WrapAndPoolCreated {
+        emit!(WrapExecuted {
             rift: rift.key(),
             user: ctx.accounts.user.key(),
-            underlying_amount: amount,
+            amount,
             fee_amount: wrap_fee,
-            tokens_minted: rift_tokens_to_user,
-            pool_underlying: amount_after_fee,
-            pool_rift: initial_rift_amount,
-            lp_tokens_minted: rift.lp_token_supply,
-            trading_fee_bps,
+            tokens_minted: rift_tokens_to_mint,
         });
 
         Ok(())
@@ -705,15 +608,11 @@ pub mod rifts_protocol {
         
         // Transfer to partner if specified
         if partner_amount > 0 && rift.partner_wallet.is_some() && ctx.accounts.partner_vault.is_some() {
-            // Safe to use ok_or here since we already checked is_some() above
-            let partner_vault = ctx.accounts.partner_vault.as_ref()
-                .ok_or(ErrorCode::MissingPartnerVault)?;
-            
             let transfer_partner_ctx = CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
                 Transfer {
                     from: ctx.accounts.vault.to_account_info(),
-                    to: partner_vault.to_account_info(),
+                    to: ctx.accounts.partner_vault.as_ref().unwrap().to_account_info(),
                     authority: ctx.accounts.vault_authority.to_account_info(),
                 },
             );
@@ -1387,63 +1286,12 @@ pub struct WrapTokens<'info> {
     )]
     pub rift_mint_authority: UncheckedAccount<'info>,
     
-    /// CHECK: Vault authority PDA  
+    /// CHECK: Vault authority PDA
     #[account(
         seeds = [b"vault_auth", rift.key().as_ref()],
         bump
     )]
     pub vault_authority: UncheckedAccount<'info>,
-    
-    /// Pool underlying token account (NEW - for LP pool)
-    #[account(
-        init_if_needed,
-        payer = user,
-        token::mint = underlying_mint,
-        token::authority = pool_authority,
-        seeds = [b"pool_underlying", rift.key().as_ref()],
-        bump
-    )]
-    pub pool_underlying: Account<'info, TokenAccount>,
-    
-    /// Pool rift token account (NEW - for LP pool)
-    #[account(
-        init_if_needed,
-        payer = user,
-        token::mint = rift_mint,
-        token::authority = pool_authority,
-        seeds = [b"pool_rift", rift.key().as_ref()],
-        bump
-    )]
-    pub pool_rift_tokens: Account<'info, TokenAccount>,
-    
-    /// LP token mint (NEW - for LP tokens)
-    #[account(
-        init_if_needed,
-        payer = user,
-        mint::decimals = 6,
-        mint::authority = lp_mint_authority,
-        seeds = [b"lp_mint", rift.key().as_ref()],
-        bump
-    )]
-    pub lp_mint: Account<'info, Mint>,
-    
-    /// User LP tokens account (NEW)
-    #[account(mut)]
-    pub user_lp_tokens: Account<'info, TokenAccount>,
-    
-    /// CHECK: PDA for LP mint authority (NEW)
-    #[account(
-        seeds = [b"lp_mint_auth", rift.key().as_ref()],
-        bump
-    )]
-    pub lp_mint_authority: UncheckedAccount<'info>,
-    
-    /// CHECK: PDA for pool authority (NEW)
-    #[account(
-        seeds = [b"pool_auth", rift.key().as_ref()],
-        bump
-    )]
-    pub pool_authority: UncheckedAccount<'info>,
     
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
@@ -1825,15 +1673,6 @@ pub struct Rift {
     pub rifts_tokens_distributed: u64, // Total RIFTS tokens distributed to LP stakers
     pub rifts_tokens_burned: u64,      // Total RIFTS tokens burned
     
-    // Meteora-style DLMM Pool (NEW - for automatic pool creation during wrapping)
-    pub liquidity_pool: Option<Pubkey>, // Meteora-compatible pool address
-    pub lp_token_supply: u64,           // Total LP tokens minted
-    pub pool_trading_fee_bps: u16,      // Trading fee for LP pool (separate from wrap fee)
-    pub total_liquidity_underlying: u64, // Underlying tokens in LP pool
-    pub total_liquidity_rift: u64,     // Rift tokens in LP pool
-    pub active_bin_id: i32,             // Current active bin ID (Meteora DLMM style)
-    pub bin_step: u16,                  // Bin step for price increments
-    
     // LP Staking
     pub total_lp_staked: u64,          // Total LP tokens staked
     pub pending_rewards: u64,          // Pending RIFTS rewards for distribution
@@ -2141,16 +1980,12 @@ pub struct StuckAccountCleaned {
 }
 
 #[event]
-pub struct WrapAndPoolCreated {
+pub struct WrapExecuted {
     pub rift: Pubkey,
     pub user: Pubkey,
-    pub underlying_amount: u64,
+    pub amount: u64,
     pub fee_amount: u64,
     pub tokens_minted: u64,
-    pub pool_underlying: u64,
-    pub pool_rift: u64,
-    pub lp_tokens_minted: u64,
-    pub trading_fee_bps: u16,
 }
 
 #[event]
@@ -2241,8 +2076,6 @@ pub enum ErrorCode {
     InvalidBurnFee,
     #[msg("Invalid partner fee (max 5%)")]
     InvalidPartnerFee,
-    #[msg("Invalid trading fee (max 1%)")]
-    InvalidTradingFee,
     #[msg("Rift name must end with '_RIFT' or 'RIFT'")]
     InvalidRiftName,
     #[msg("Rift name too long (max 32 chars)")]
@@ -2327,10 +2160,6 @@ pub enum ErrorCode {
     RiftPaused,
     #[msg("Insufficient oracle responses")]
     InsufficientOracles,
-    #[msg("Partner vault account is missing")]
-    MissingPartnerVault,
-    #[msg("Invalid bin step for DLMM pool")]
-    InvalidBinStep,
 }
 
 // Oracle update instruction implementations

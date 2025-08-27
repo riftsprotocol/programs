@@ -236,8 +236,12 @@ pub mod fee_collector {
             .ok_or(FeeCollectorError::MathOverflow)?;
         
         // Apply slippage check
+        let slippage_factor = 10000u64
+            .checked_sub(max_slippage_bps as u64)
+            .ok_or(FeeCollectorError::MathOverflow)?;
+        
         let min_acceptable = expected_rifts_out
-            .checked_mul(10000u64.checked_sub(max_slippage_bps as u64).unwrap())
+            .checked_mul(slippage_factor)
             .ok_or(FeeCollectorError::MathOverflow)?
             .checked_div(10000)
             .ok_or(FeeCollectorError::MathOverflow)?;
