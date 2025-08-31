@@ -122,8 +122,8 @@ pub mod governance {
         let vote_record = &mut ctx.accounts.vote_record;
         let current_time = Clock::get()?.unix_timestamp;
         
-        // Use snapshot-based vote power to prevent flash loan attacks
-        let voter_rifts_balance = ctx.accounts.voter_rifts_account.amount;
+        // **SECURITY FIX**: Use snapshot balance system for voting power
+        let _existing_voting_power = vote_record.voting_power;
         
         // Require tokens to be held since before proposal creation (24 hours minimum)
         require!(
@@ -131,12 +131,40 @@ pub mod governance {
             GovernanceError::InsufficientHoldingPeriod
         );
         
-        // Verify voter had tokens before proposal creation (additional flash loan protection)
-        let existing_voting_power = vote_record.voting_power;
+        // **CRITICAL SECURITY FIX**: Use proper snapshot voting system to prevent flash loan attacks
+        let current_balance = ctx.accounts.voter_rifts_account.amount;
+        let snapshot_account = &ctx.accounts.snapshot_account;
+        
+        // Verify snapshot account is valid for this proposal
         require!(
-            ctx.accounts.voter_rifts_account.amount >= existing_voting_power || 
-            existing_voting_power == 0, // First time voting
+            snapshot_account.proposal == proposal.key(),
+            GovernanceError::InvalidSnapshot
+        );
+        require!(
+            snapshot_account.voter == ctx.accounts.voter.key(),
+            GovernanceError::InvalidSnapshot
+        );
+        require!(
+            snapshot_account.snapshot_timestamp == proposal.snapshot_taken_at,
+            GovernanceError::InvalidSnapshot
+        );
+        
+        // Use snapshot balance to prevent flash loan attacks
+        let snapshot_balance = snapshot_account.token_balance;
+        
+        // **SECURITY REQUIREMENT**: Voter must still hold at least their snapshot balance
+        require!(
+            current_balance >= snapshot_balance,
             GovernanceError::TokenBalanceDecreased
+        );
+        
+        // **SECURITY IMPROVEMENT**: Minimum voting power requirement
+        let min_voting_power = proposal.min_participation_required
+            .checked_div(1000) // Require 0.1% of minimum participation
+            .ok_or(GovernanceError::MathOverflow)?;
+        require!(
+            snapshot_balance >= min_voting_power,
+            GovernanceError::InsufficientTokensToVote
         );
         
         // Check voting period
@@ -150,12 +178,12 @@ pub mod governance {
             GovernanceError::ProposalNotActive
         );
         
-        // Require minimum RIFTS balance to vote
+        // Require minimum RIFTS balance to vote (using snapshot balance)
         let min_vote_tokens = 100u64
             .checked_mul(10u64.pow(9))
             .ok_or(GovernanceError::MathOverflow)?;
         require!(
-            voter_rifts_balance >= min_vote_tokens,
+            snapshot_balance >= min_vote_tokens,
             GovernanceError::InsufficientTokensToVote
         );
         
@@ -165,23 +193,23 @@ pub mod governance {
             GovernanceError::AlreadyVoted
         );
         
-        // Record the vote
+        // **SECURITY FIX**: Record the vote using snapshot balance for voting power
         vote_record.voter = ctx.accounts.voter.key();
         vote_record.proposal = proposal.key();
         vote_record.vote = vote;
-        vote_record.voting_power = voter_rifts_balance;
+        vote_record.voting_power = snapshot_balance; // Use snapshot balance, not current balance
         vote_record.timestamp = current_time;
         
-        // **CRITICAL FIX**: Update proposal vote counts with checked arithmetic
+        // **CRITICAL FIX**: Update proposal vote counts with snapshot balance
         match vote {
             VoteChoice::For => {
                 proposal.votes_for = proposal.votes_for
-                    .checked_add(voter_rifts_balance)
+                    .checked_add(snapshot_balance)
                     .ok_or(GovernanceError::VoteOverflow)?;
             }
             VoteChoice::Against => {
                 proposal.votes_against = proposal.votes_against
-                    .checked_add(voter_rifts_balance)
+                    .checked_add(snapshot_balance)
                     .ok_or(GovernanceError::VoteOverflow)?;
             }
         }
@@ -193,7 +221,7 @@ pub mod governance {
             proposal_id: proposal.id,
             voter: vote_record.voter,
             vote,
-            voting_power: voter_rifts_balance,
+            voting_power: snapshot_balance,
         });
         
         Ok(())
@@ -483,6 +511,13 @@ pub struct CastVote<'info> {
     )]
     pub voter_rifts_account: Account<'info, TokenAccount>,
     
+    /// **SECURITY FIX**: Snapshot account for flash loan protection
+    #[account(
+        constraint = snapshot_account.proposal == proposal.key(),
+        constraint = snapshot_account.voter == voter.key()
+    )]
+    pub snapshot_account: Account<'info, SnapshotAccount>,
+    
     pub system_program: Program<'info, System>,
 }
 
@@ -576,6 +611,14 @@ pub struct VoteSnapshot {
     pub voter: Pubkey,
     pub snapshot_power: u64,  // Vote power at proposal creation
     pub snapshot_taken_at: i64,
+}
+
+#[account]
+pub struct SnapshotAccount {
+    pub proposal: Pubkey,
+    pub voter: Pubkey,
+    pub token_balance: u64,
+    pub snapshot_timestamp: i64,
 }
 
 // Enums
@@ -760,4 +803,8 @@ pub enum GovernanceError {
     InvalidSpillAccount,
     #[msg("Unauthorized upgrade attempt")]
     UnauthorizedUpgrade,
+    #[msg("Insufficient token balance at snapshot time")]
+    InsufficientSnapshotBalance,
+    #[msg("Invalid or mismatched snapshot account")]
+    InvalidSnapshot,
 }

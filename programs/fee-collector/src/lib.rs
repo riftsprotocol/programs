@@ -1,7 +1,6 @@
 // Fee Collector Program - Handles automated RIFTS token buybacks and distribution
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
-use std::str::FromStr;
 
 declare_id!("B8QoBZH3jDcyQueDVj8K8nBxKssHdzWiYeP4HJXRtcRR");
 
@@ -36,6 +35,14 @@ pub mod fee_collector {
         collector.successful_swaps = 0;
         collector.failed_swaps = 0;
         
+        // Initialize configurable external program IDs
+        collector.jupiter_program_id = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".parse::<Pubkey>()
+            .map_err(|_| FeeCollectorError::InvalidProgramId)?;
+        
+        // Initialize rate limiting
+        collector.last_collection_timestamp = Clock::get()?.unix_timestamp;
+        collector.collections_in_current_hour = 0;
+        
         Ok(())
     }
     
@@ -48,6 +55,23 @@ pub mod fee_collector {
         
         // Add rate limiting - max 10 fee collections per hour
         let current_time = Clock::get()?.unix_timestamp;
+        let time_since_last = current_time - collector.last_collection_timestamp;
+        
+        // Reset counter if more than 1 hour has passed
+        if time_since_last >= 3600 {
+            collector.collections_in_current_hour = 0;
+            collector.last_collection_timestamp = current_time;
+        }
+        
+        // Check rate limit
+        require!(
+            collector.collections_in_current_hour < 10,
+            FeeCollectorError::RateLimitExceeded
+        );
+        
+        // Increment collection counter
+        collector.collections_in_current_hour += 1;
+        
         require!(
             fee_amount > 0 && fee_amount <= 1_000_000_000_000, // Max 1 trillion tokens
             FeeCollectorError::InvalidFeeAmount
@@ -101,13 +125,24 @@ pub mod fee_collector {
         let jupiter_accounts = &ctx.remaining_accounts;
         require!(jupiter_accounts.len() >= 8, FeeCollectorError::InsufficientJupiterAccounts);
         
+        // Calculate minimum expected output with proper overflow handling
+        let minimum_amount_out = swap_amount
+            .checked_mul(95)
+            .ok_or(FeeCollectorError::MathOverflow)?
+            .checked_div(100)
+            .ok_or(FeeCollectorError::MathOverflow)?;
+        
+        require!(minimum_amount_out > 0, FeeCollectorError::InvalidMinimumOut);
+        
         // Build Jupiter swap instruction with actual market data
         let swap_instruction = build_jupiter_swap_instruction(
             &ctx.accounts.collector_vault.key(),
             &ctx.accounts.rifts_vault.key(),
             &ctx.accounts.authority.key(),
             swap_amount,
+            minimum_amount_out,
             jupiter_accounts,
+            collector.jupiter_program_id,
         )?;
         
         // Execute Jupiter swap via CPI
@@ -125,9 +160,18 @@ pub mod fee_collector {
             signer_seeds,
         )?;
         
-        // Get actual RIFTS tokens received from the swap
-        // The client should pass the before balance, but for safety we use the swap amount
-        let rifts_bought = swap_amount; // In real DEX integration this would be the actual received amount
+        // **CRITICAL FIX**: Get actual RIFTS tokens received from the swap
+        // Read the actual balance change from the destination vault
+        let rifts_vault_balance_after = ctx.accounts.rifts_vault.amount;
+        let rifts_bought = rifts_vault_balance_after
+            .checked_sub(ctx.accounts.rifts_vault_balance_before.amount)
+            .ok_or(FeeCollectorError::SwapOutputCalculationError)?;
+        
+        // Ensure we received at least the minimum expected amount
+        require!(
+            rifts_bought >= minimum_amount_out,
+            FeeCollectorError::InsufficientSwapOutput
+        );
         let lp_staker_amount = rifts_bought
             .checked_mul(90)
             .ok_or(FeeCollectorError::MathOverflow)?
@@ -250,12 +294,15 @@ pub mod fee_collector {
         
         // Execute the swap with Jupiter integration
         let jupiter_swap_accounts = &ctx.remaining_accounts;
+        let jupiter_program_id = collector.jupiter_program_id;
         let swap_instruction = build_jupiter_swap_instruction(
             &ctx.accounts.source_vault.key(),
             &ctx.accounts.destination_vault.key(),
             &ctx.accounts.vault_authority.key(),
             amount_in,
+            minimum_out,
             jupiter_swap_accounts,
+            jupiter_program_id,
         )?;
         
         let collector_key = collector.key();
@@ -287,19 +334,45 @@ pub mod fee_collector {
         
         Ok(())
     }
+    
+    /// Update Jupiter program ID (authority only)
+    pub fn update_jupiter_program_id(
+        ctx: Context<UpdateJupiterProgramId>,
+        new_jupiter_program_id: Pubkey,
+    ) -> Result<()> {
+        let collector = &mut ctx.accounts.fee_collector;
+        
+        // Validate the new program ID is not default
+        require!(
+            new_jupiter_program_id != Pubkey::default(),
+            FeeCollectorError::InvalidProgramId
+        );
+        
+        let old_jupiter_id = collector.jupiter_program_id;
+        collector.jupiter_program_id = new_jupiter_program_id;
+        
+        emit!(JupiterProgramIdUpdated {
+            fee_collector: collector.key(),
+            authority: ctx.accounts.authority.key(),
+            old_program_id: old_jupiter_id,
+            new_program_id: new_jupiter_program_id,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        
+        Ok(())
+    }
 }
 
 // Jupiter integration helper functions
 fn build_jupiter_swap_instruction(
-    source_vault: &Pubkey,
-    destination_vault: &Pubkey,
-    authority: &Pubkey,
+    _source_vault: &Pubkey,
+    _destination_vault: &Pubkey,
+    _authority: &Pubkey,
     amount_in: u64,
+    minimum_amount_out: u64,
     jupiter_accounts: &[AccountInfo],
+    jupiter_program_id: Pubkey,
 ) -> Result<anchor_lang::solana_program::instruction::Instruction> {
-    // Jupiter program ID (v6)
-    let jupiter_program_id = Pubkey::from_str("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4")
-        .map_err(|_| FeeCollectorError::InvalidJupiterProgram)?;
     
     // Validate we have required accounts (minimum for Jupiter swap)
     require!(jupiter_accounts.len() >= 16, FeeCollectorError::InsufficientJupiterAccounts);
@@ -307,10 +380,9 @@ fn build_jupiter_swap_instruction(
     // Jupiter swap instruction discriminator (route)
     let mut instruction_data = vec![0xE4, 0x45, 0x65, 0x31, 0x4C, 0x51, 0x95, 0x45]; // "route" discriminator
     
-    // Add swap data
     let swap_data = JupiterSwapData {
         amount_in,
-        minimum_amount_out: amount_in.checked_mul(95).unwrap_or(0).checked_div(100).unwrap_or(0), // 5% slippage
+        minimum_amount_out,
         platform_fee_bps: 0,
     };
     
@@ -417,6 +489,10 @@ pub struct ProcessFees<'info> {
     #[account(mut)]
     pub rifts_vault: Account<'info, TokenAccount>,
     
+    /// **CRITICAL FIX**: Account to track vault balance before swap
+    /// This should be passed by the client with the pre-swap balance
+    pub rifts_vault_balance_before: Account<'info, TokenAccount>,
+    
     /// CHECK: Collector authority PDA
     #[account(
         seeds = [b"fee_collector_authority", fee_collector.key().as_ref()],
@@ -492,6 +568,17 @@ pub struct ExecuteBuybackWithSlippage<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+#[derive(Accounts)]
+pub struct UpdateJupiterProgramId<'info> {
+    #[account(
+        constraint = authority.key() == fee_collector.authority @ FeeCollectorError::Unauthorized
+    )]
+    pub authority: Signer<'info>,
+    
+    #[account(mut)]
+    pub fee_collector: Account<'info, FeeCollector>,
+}
+
 // State accounts
 #[account]
 pub struct FeeCollector {
@@ -513,6 +600,13 @@ pub struct FeeCollector {
     pub last_buyback_timestamp: i64,
     pub successful_swaps: u64,
     pub failed_swaps: u64,
+    
+    // Configurable external program IDs
+    pub jupiter_program_id: Pubkey,
+    
+    // Rate limiting for fee collections
+    pub last_collection_timestamp: i64,
+    pub collections_in_current_hour: u8,
 }
 
 
@@ -547,6 +641,15 @@ pub struct PriceUpdated {
     pub timestamp: i64,
 }
 
+#[event]
+pub struct JupiterProgramIdUpdated {
+    pub fee_collector: Pubkey,
+    pub authority: Pubkey,
+    pub old_program_id: Pubkey,
+    pub new_program_id: Pubkey,
+    pub timestamp: i64,
+}
+
 // Errors
 #[error_code]
 pub enum FeeCollectorError {
@@ -566,6 +669,8 @@ pub enum FeeCollectorError {
     InvalidSeedComponent,
     #[msg("Invalid fee amount")]
     InvalidFeeAmount,
+    #[msg("Rate limit exceeded - too many collections per hour")]
+    RateLimitExceeded,
     #[msg("Insufficient Jupiter accounts provided")]
     InsufficientJupiterAccounts,
     #[msg("Swap execution failed")]
@@ -582,4 +687,8 @@ pub enum FeeCollectorError {
     InvalidJupiterProgram,
     #[msg("Serialization error")]
     SerializationError,
+    #[msg("Failed to calculate swap output from balance change")]
+    SwapOutputCalculationError,
+    #[msg("Insufficient swap output received")]
+    InsufficientSwapOutput,
 }

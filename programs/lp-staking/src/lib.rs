@@ -140,16 +140,20 @@ pub mod lp_staking {
         );
         token::transfer(cpi_ctx, amount)?;
         
-        // Update user stake
-        user_stake.amount -= amount;
+        // **CRITICAL FIX**: Update user stake with checked arithmetic
+        user_stake.amount = user_stake.amount
+            .checked_sub(amount)
+            .ok_or(StakingError::MathOverflow)?;
         user_stake.reward_debt = user_stake.amount
             .checked_mul(pool.accumulated_rewards_per_share)
             .ok_or(StakingError::MathOverflow)?
             .checked_div(PRECISION)
             .ok_or(StakingError::MathOverflow)?;
         
-        // Update pool total
-        pool.total_staked -= amount;
+        // **CRITICAL FIX**: Update pool total with checked arithmetic
+        pool.total_staked = pool.total_staked
+            .checked_sub(amount)
+            .ok_or(StakingError::MathOverflow)?;
         
         emit!(UnstakeEvent {
             user: ctx.accounts.user.key(),

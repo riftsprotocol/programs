@@ -1,7 +1,6 @@
 [toolchain]
-anchor_version = "0.29.0"
+anchor_version = "0.30.0"
 solana_version = "1.18.26"
-sbf_tools = true
 
 [features]
 seeds = false
@@ -15,9 +14,9 @@ lp_staking = "4kQhF3BfLPRXVN4m3YpZHrG4T5X3ZPk3JUj2L8TdN7W2"
 
 [programs.devnet]
 rifts_protocol = "8FX1CVcR4QZyvTYtV6rG42Ha1K2qyRNykKYcwVctspUh"
-fee_collector = "B8QoBZH3jDcyQueDVj8K8nBxKssHdzWiYeP4HJXRtcRR"
+fee_collector = "4L72SYrfq8PYa6C2eAwZzox8YKuSG6Moq9yRdyhFFZCp"
 governance = "7rYo4k9xGmQU7zkQEBqjfBU1y9hkQnRFtFbpn23dZNQR"
-lp_staking = "4kQhF3BfLPRXVN4m3YpZHrG4T5X3ZPk3JUj2L8TdN7W2"
+lp_staking = "BfMrsB9C2C3gxBzL3DrHMPaJeGXG9bK7nKcJTAHeQ5n1"
 
 [registry]
 url = "https://api.apr.dev"
@@ -30,5 +29,5 @@ wallet = "./deployment-keypair.json"
 test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
 
 [build]
-skip-idl = true
+skip-idl = false
 target-dir = "C:/tmp/target"

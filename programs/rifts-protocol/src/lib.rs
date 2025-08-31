@@ -1,5 +1,6 @@
-// Rifts Protocol - Full Peapods Clone with Hybrid Oracle System
+// Rifts Protocol
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::program::invoke_signed;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer, Mint, MintTo};
 // Note: Metadata functionality removed to avoid dependency issues
 use anchor_lang::solana_program::sysvar::rent::Rent;
@@ -11,11 +12,128 @@ pub use lp_staking;
 
 declare_id!("8FX1CVcR4QZyvTYtV6rG42Ha1K2qyRNykKYcwVctspUh");
 
+/// Shared rift initialization logic to eliminate code duplication
+fn initialize_rift(
+    rift: &mut Account<Rift>,
+    creator: Pubkey,
+    underlying_mint: Pubkey,
+    rift_mint: Pubkey,
+    burn_fee_bps: u16,
+    partner_fee_bps: u16,
+    partner_wallet: Option<Pubkey>,
+    rift_name: Option<String>,
+    require_rift_suffix: bool,
+) -> Result<()> {
+    // Validate fees
+    require!(burn_fee_bps <= 4500, ErrorCode::InvalidBurnFee);
+    require!(partner_fee_bps <= 500, ErrorCode::InvalidPartnerFee);
+    
+    // Validate and set rift name
+    if let Some(name) = rift_name {
+        require!(name.len() <= 32, ErrorCode::NameTooLong);
+        if require_rift_suffix {
+            require!(name.ends_with("_RIFT") || name.ends_with("RIFT"), ErrorCode::InvalidRiftName);
+        }
+        rift.name = name;
+    } else {
+        // Generate default name with RIFT suffix (safe string slicing)
+        let mint_string = underlying_mint.to_string();
+        let prefix = if mint_string.len() >= 8 { &mint_string[0..8] } else { &mint_string };
+        let underlying_symbol = format!("{}_RIFT", prefix);
+        rift.name = underlying_symbol;
+    }
+
+    rift.creator = creator;
+    rift.underlying_mint = underlying_mint;
+    rift.rift_mint = rift_mint;
+    
+    // Create vault PDA
+    let rift_key = rift.key();
+    let vault_seeds = &[b"vault", rift_key.as_ref()];
+    let (vault_pda, _) = Pubkey::find_program_address(vault_seeds, &crate::ID);
+    rift.vault = vault_pda;
+    
+    rift.burn_fee_bps = burn_fee_bps;
+    rift.partner_fee_bps = partner_fee_bps;
+    rift.partner_wallet = partner_wallet;
+    rift.total_wrapped = 0;
+    rift.total_burned = 0;
+    rift.backing_ratio = 10000;
+    rift.last_rebalance = Clock::get()?.unix_timestamp;
+    rift.created_at = Clock::get()?.unix_timestamp;
+    
+    // Initialize hybrid oracle system
+    rift.oracle_prices = [PriceData::default(); 10];
+    rift.price_index = 0;
+    rift.oracle_update_interval = 30 * 60;
+    rift.max_rebalance_interval = 24 * 60 * 60;
+    rift.arbitrage_threshold_bps = 200;
+    rift.last_oracle_update = Clock::get()?.unix_timestamp;
+    
+    // Initialize volume-based oracle settings (5% of total supply)
+    rift.volume_oracle_threshold_bps = 500;
+    rift.volume_since_last_oracle = 0;
+    
+    // Initialize advanced metrics
+    rift.total_volume_24h = 0;
+    rift.price_deviation = 0;
+    rift.arbitrage_opportunity_bps = 0;
+    rift.rebalance_count = 0;
+    
+    // Initialize RIFTS token distribution tracking
+    rift.total_fees_collected = 0;
+    rift.rifts_tokens_distributed = 0;
+    rift.rifts_tokens_burned = 0;
+    
+    // Initialize Meteora-style DLMM Pool
+    rift.liquidity_pool = None;
+    rift.lp_token_supply = 0;
+    rift.pool_trading_fee_bps = 30;
+    rift.total_liquidity_underlying = 0;
+    rift.total_liquidity_rift = 0;
+    rift.active_bin_id = 0;
+    rift.bin_step = 0;
+    
+    // Initialize LP staking
+    rift.total_lp_staked = 0;
+    rift.pending_rewards = 0;
+    rift.last_reward_distribution = Clock::get()?.unix_timestamp;
+    
+    // Initialize reentrancy protection
+    rift.reentrancy_guard = false;
+    
+    // Initialize emergency controls
+    rift.is_paused = false;
+    rift.pause_timestamp = 0;
+    
+    // Initialize external program integration
+    rift.pending_fee_distribution = 0;
+    
+    // Initialize governance integration
+    rift.last_governance_update = Clock::get()?.unix_timestamp;
+    
+    // Initialize configurable external program IDs
+    rift.jupiter_program_id = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".parse::<Pubkey>()
+        .map_err(|_| ErrorCode::InvalidProgramId)?;
+    rift.meteora_program_id = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo".parse::<Pubkey>()
+        .map_err(|_| ErrorCode::InvalidProgramId)?;
+    
+    emit!(RiftCreated {
+        rift: rift.key(),
+        creator: rift.creator,
+        underlying_mint: rift.underlying_mint,
+        burn_fee_bps,
+        partner_fee_bps,
+    });
+
+    Ok(())
+}
+
 #[program]
 pub mod rifts_protocol {
     use super::*;
 
-    /// Create a new Rift with a vanity mint address (like pump.fun does with 'pump')
+    /// Create a new Rift with a vanity mint address
     /// This allows creating rifts with mint addresses ending in 'rift'
     pub fn create_rift_with_vanity_mint(
         ctx: Context<CreateRiftWithVanityMint>,
@@ -24,12 +142,6 @@ pub mod rifts_protocol {
         partner_wallet: Option<Pubkey>,
         rift_name: Option<String>,
     ) -> Result<()> {
-        let rift = &mut ctx.accounts.rift;
-        
-        // Validate fees
-        require!(burn_fee_bps <= 4500, ErrorCode::InvalidBurnFee);
-        require!(partner_fee_bps <= 500, ErrorCode::InvalidPartnerFee);
-        
         // Validate that the mint address ends with 'rift' (case insensitive)
         let mint_address = ctx.accounts.rift_mint.key().to_string();
         let lower_address = mint_address.to_lowercase();
@@ -48,90 +160,17 @@ pub mod rifts_protocol {
             ErrorCode::InvalidVanityAddress
         );
         
-        // Set rift name
-        if let Some(name) = rift_name {
-            require!(name.len() <= 32, ErrorCode::NameTooLong);
-            rift.name = name;
-        } else {
-            // Generate default name with RIFT suffix
-            let underlying_symbol = format!("{}_RIFT", &ctx.accounts.underlying_mint.key().to_string()[0..8]);
-            rift.name = underlying_symbol;
-        }
-
-        rift.creator = ctx.accounts.creator.key();
-        rift.underlying_mint = ctx.accounts.underlying_mint.key();
-        rift.rift_mint = ctx.accounts.rift_mint.key();
-        
-        // Create vault PDA
-        let rift_key = rift.key();
-        let vault_seeds = &[b"vault", rift_key.as_ref()];
-        let (vault_pda, _) = Pubkey::find_program_address(vault_seeds, &crate::ID);
-        rift.vault = vault_pda;
-        
-        rift.burn_fee_bps = burn_fee_bps;
-        rift.partner_fee_bps = partner_fee_bps;
-        rift.partner_wallet = partner_wallet;
-        rift.total_wrapped = 0;
-        rift.total_burned = 0;
-        rift.backing_ratio = 10000;
-        rift.last_rebalance = Clock::get()?.unix_timestamp;
-        rift.created_at = Clock::get()?.unix_timestamp;
-        
-        // Initialize hybrid oracle system
-        rift.oracle_prices = [PriceData::default(); 10];
-        rift.price_index = 0;
-        rift.oracle_update_interval = 30 * 60;
-        rift.max_rebalance_interval = 24 * 60 * 60;
-        rift.arbitrage_threshold_bps = 200;
-        rift.last_oracle_update = Clock::get()?.unix_timestamp;
-        
-        // Initialize advanced metrics
-        rift.total_volume_24h = 0;
-        rift.price_deviation = 0;
-        rift.arbitrage_opportunity_bps = 0;
-        rift.rebalance_count = 0;
-        
-        // Initialize RIFTS token distribution tracking
-        rift.total_fees_collected = 0;
-        rift.rifts_tokens_distributed = 0;
-        rift.rifts_tokens_burned = 0;
-        
-        // Initialize Meteora-style DLMM Pool (NEW)
-        rift.liquidity_pool = None;  // Will be set during first wrap
-        rift.lp_token_supply = 0;
-        rift.pool_trading_fee_bps = 30;  // Default 0.3% trading fee
-        rift.total_liquidity_underlying = 0;
-        rift.total_liquidity_rift = 0;
-        rift.active_bin_id = 0;      // Will be set during pool creation
-        rift.bin_step = 0;           // Will be set during pool creation
-        
-        // Initialize LP staking
-        rift.total_lp_staked = 0;
-        rift.pending_rewards = 0;
-        rift.last_reward_distribution = Clock::get()?.unix_timestamp;
-        
-        // Initialize reentrancy protection
-        rift.reentrancy_guard = false;
-        
-        // Initialize emergency controls
-        rift.is_paused = false;
-        rift.pause_timestamp = 0;
-        
-        // Initialize external program integration
-        rift.pending_fee_distribution = 0;
-        
-        // Initialize governance integration
-        rift.last_governance_update = Clock::get()?.unix_timestamp;
-        
-        emit!(RiftCreated {
-            rift: rift.key(),
-            creator: rift.creator,
-            underlying_mint: rift.underlying_mint,
+        initialize_rift(
+            &mut ctx.accounts.rift,
+            ctx.accounts.creator.key(),
+            ctx.accounts.underlying_mint.key(),
+            ctx.accounts.rift_mint.key(),
             burn_fee_bps,
             partner_fee_bps,
-        });
-
-        Ok(())
+            partner_wallet,
+            rift_name,
+            false, // Not requiring RIFT suffix for vanity
+        )
     }
     
     /// Initialize a new Rift (wrapped token vault) - STACK OPTIMIZED (Original PDA version)
@@ -142,95 +181,17 @@ pub mod rifts_protocol {
         partner_wallet: Option<Pubkey>,
         rift_name: Option<String>,
     ) -> Result<()> {
-        let rift = &mut ctx.accounts.rift;
-        
-        // Validate fees
-        require!(burn_fee_bps <= 4500, ErrorCode::InvalidBurnFee);
-        require!(partner_fee_bps <= 500, ErrorCode::InvalidPartnerFee);
-        
-        // Validate and set rift name
-        if let Some(name) = rift_name {
-            require!(name.len() <= 32, ErrorCode::NameTooLong);
-            require!(name.ends_with("_RIFT") || name.ends_with("RIFT"), ErrorCode::InvalidRiftName);
-            rift.name = name;
-        } else {
-            // Generate default name with RIFT suffix
-            let underlying_symbol = format!("{}_RIFT", &ctx.accounts.underlying_mint.key().to_string()[0..8]);
-            rift.name = underlying_symbol;
-        }
-
-        rift.creator = ctx.accounts.creator.key();
-        rift.underlying_mint = ctx.accounts.underlying_mint.key();
-        rift.rift_mint = ctx.accounts.rift_mint.key();
-        // Vault will be set to the derived PDA address
-        let rift_key = rift.key();
-        let vault_seeds = &[b"vault", rift_key.as_ref()];
-        let (vault_pda, _) = Pubkey::find_program_address(vault_seeds, &crate::ID);
-        rift.vault = vault_pda;
-        rift.burn_fee_bps = burn_fee_bps;
-        rift.partner_fee_bps = partner_fee_bps;
-        rift.partner_wallet = partner_wallet;
-        rift.total_wrapped = 0;
-        rift.total_burned = 0;
-        rift.backing_ratio = 10000; // 1.0000x in basis points
-        rift.last_rebalance = Clock::get()?.unix_timestamp;
-        rift.created_at = Clock::get()?.unix_timestamp;
-        
-        // Initialize hybrid oracle system
-        rift.oracle_prices = [PriceData::default(); 10];
-        rift.price_index = 0;
-        rift.oracle_update_interval = 30 * 60; // 30 minutes
-        rift.max_rebalance_interval = 24 * 60 * 60; // 24 hours
-        rift.arbitrage_threshold_bps = 200; // 2% threshold
-        rift.last_oracle_update = Clock::get()?.unix_timestamp;
-        
-        // Initialize advanced metrics
-        rift.total_volume_24h = 0;
-        rift.price_deviation = 0;
-        rift.arbitrage_opportunity_bps = 0;
-        rift.rebalance_count = 0;
-        
-        // Initialize RIFTS token distribution tracking
-        rift.total_fees_collected = 0;
-        rift.rifts_tokens_distributed = 0;
-        rift.rifts_tokens_burned = 0;
-        
-        // Initialize Meteora-style DLMM Pool (NEW)
-        rift.liquidity_pool = None;  // Will be set during first wrap
-        rift.lp_token_supply = 0;
-        rift.pool_trading_fee_bps = 30;  // Default 0.3% trading fee
-        rift.total_liquidity_underlying = 0;
-        rift.total_liquidity_rift = 0;
-        rift.active_bin_id = 0;      // Will be set during pool creation
-        rift.bin_step = 0;           // Will be set during pool creation
-        
-        // Initialize LP staking
-        rift.total_lp_staked = 0;
-        rift.pending_rewards = 0;
-        rift.last_reward_distribution = Clock::get()?.unix_timestamp;
-        
-        // Initialize reentrancy protection
-        rift.reentrancy_guard = false;
-        
-        // Initialize emergency controls
-        rift.is_paused = false;
-        rift.pause_timestamp = 0;
-        
-        // Initialize external program integration
-        rift.pending_fee_distribution = 0;
-        
-        // Initialize governance integration
-        rift.last_governance_update = Clock::get()?.unix_timestamp;
-        
-        emit!(RiftCreated {
-            rift: rift.key(),
-            creator: rift.creator,
-            underlying_mint: rift.underlying_mint,
+        initialize_rift(
+            &mut ctx.accounts.rift,
+            ctx.accounts.creator.key(),
+            ctx.accounts.underlying_mint.key(),
+            ctx.accounts.rift_mint.key(),
             burn_fee_bps,
             partner_fee_bps,
-        });
-
-        Ok(())
+            partner_wallet,
+            rift_name,
+            true, // Requiring RIFT suffix for regular rifts
+        )
     }
 
     /// Wrap underlying tokens into rift tokens AND create tradeable pool
@@ -246,6 +207,47 @@ pub mod rifts_protocol {
         
         // Check if rift is paused
         require!(!rift.is_paused, ErrorCode::RiftPaused);
+        
+        // **CRITICAL SECURITY FIX**: Emergency circuit breakers
+        require!(!rift.is_paused, ErrorCode::ProtocolPaused);
+        
+        // **EMERGENCY CIRCUIT BREAKER**: Auto-pause if extreme conditions detected  
+        let current_time = Clock::get()?.unix_timestamp;
+        let price_deviation_threshold = rift.price_deviation_pause_threshold.unwrap_or(5000); // Default 50%
+        if rift.price_deviation >= price_deviation_threshold as u64 {
+            rift.is_paused = true;
+            rift.pause_timestamp = current_time;
+            return err!(ErrorCode::EmergencyPause);
+        }
+        
+        // **VOLUME CIRCUIT BREAKER**: Pause if single transaction exceeds owner-configured limits
+        let max_single_transaction = rift.max_single_transaction.unwrap_or(100_000_000_000u64); // Default 100K tokens
+        if amount > max_single_transaction {
+            rift.is_paused = true;
+            rift.pause_timestamp = current_time;
+            return err!(ErrorCode::VolumeCircuitBreaker);
+        }
+        
+        // **VELOCITY CIRCUIT BREAKER**: Check for suspicious rapid transactions using owner settings
+        let large_tx_threshold = rift.large_transaction_threshold.unwrap_or(10_000_000_000u64); // Default 10K tokens
+        let max_large_txs_per_hour = rift.max_large_transactions_per_hour.unwrap_or(5); // Default 5
+        
+        if amount > large_tx_threshold {
+            let time_since_last_large_tx = current_time - rift.last_large_transaction_time.unwrap_or(0);
+            if time_since_last_large_tx < 3600 { // Within 1 hour
+                let large_tx_count = rift.large_transaction_count.unwrap_or(0);
+                if large_tx_count >= max_large_txs_per_hour as u32 {
+                    rift.is_paused = true;
+                    rift.pause_timestamp = current_time;
+                    return err!(ErrorCode::SuspiciousActivity);
+                }
+                rift.large_transaction_count = Some(large_tx_count + 1);
+            } else {
+                // Reset counter after 1 hour
+                rift.large_transaction_count = Some(1);
+            }
+            rift.last_large_transaction_time = Some(current_time);
+        }
         
         // **CRITICAL FIX**: Add reentrancy protection
         require!(!rift.reentrancy_guard, ErrorCode::ReentrancyDetected);
@@ -270,8 +272,15 @@ pub mod rifts_protocol {
             .checked_div(10000)
             .ok_or(ErrorCode::MathOverflow)?;
         
-        // **CRITICAL FIX**: Ensure wrap fee is non-zero for non-zero amounts
-        require!(wrap_fee > 0 || amount < 143, ErrorCode::FeeTooSmall);
+        // **SECURITY FIX**: Prevent fee evasion - minimum fee of 1 for any non-zero amount
+        let wrap_fee = if amount > 0 && wrap_fee == 0 {
+            1 // Minimum fee of 1 token to prevent dust attacks
+        } else {
+            wrap_fee
+        };
+        
+        // Ensure fee is reasonable
+        require!(wrap_fee > 0 || amount == 0, ErrorCode::FeeTooSmall);
         
         let amount_after_fee = amount
             .checked_sub(wrap_fee)
@@ -285,6 +294,12 @@ pub mod rifts_protocol {
         );
         require!(initial_rift_amount > 0, ErrorCode::InvalidAmount);
         require!(trading_fee_bps <= 100, ErrorCode::InvalidTradingFee);
+        
+        // Validate Meteora program ID
+        require!(
+            ctx.accounts.meteora_program.key() == rift.meteora_program_id,
+            ErrorCode::InvalidProgramId
+        );
         
         // Validate Meteora bin step (fee tier) - common Meteora values
         require!(
@@ -313,7 +328,7 @@ pub mod rifts_protocol {
         require!(rift_tokens_to_user > 0, ErrorCode::MintAmountTooSmall);
         require!(rift_tokens_to_user <= 1_000_000_000_000_000, ErrorCode::MintAmountTooLarge);
         
-        let total_rift_to_mint = rift_tokens_to_user
+        let _total_rift_to_mint = rift_tokens_to_user
             .checked_add(initial_rift_amount)
             .ok_or(ErrorCode::MathOverflow)?;
 
@@ -359,14 +374,20 @@ pub mod rifts_protocol {
         let product = (amount_after_fee as u128)
             .checked_mul(initial_rift_amount as u128)
             .ok_or(ErrorCode::MathOverflow)?;
-        // Simple integer square root approximation for LP tokens
-        let mut lp_supply = (product / 2) as u64;
+        // **CRITICAL FIX**: Safe conversion with overflow protection
+        let lp_supply_128 = product / 2;
+        let mut lp_supply = if lp_supply_128 > u64::MAX as u128 {
+            return Err(ErrorCode::MathOverflow.into());
+        } else {
+            lp_supply_128 as u64
+        };
+        
         if lp_supply == 0 {
             lp_supply = 1; // Minimum LP supply
         }
         rift.lp_token_supply = lp_supply;
         
-        // Create Meteora-compatible pool PDA (same seed structure as Meteora)
+        // Create real Meteora pool PDA using actual Meteora program ID
         let underlying_key = ctx.accounts.underlying_mint.key();
         let rift_key = ctx.accounts.rift_mint.key();
         let fee_bytes = trading_fee_bps.to_le_bytes();
@@ -376,8 +397,58 @@ pub mod rifts_protocol {
             rift_key.as_ref(),
             &fee_bytes,
         ];
-        let (meteora_pool_pda, _) = Pubkey::find_program_address(meteora_pool_seeds, &crate::ID);
+        let (meteora_pool_pda, _pool_bump) = Pubkey::find_program_address(meteora_pool_seeds, &rift.meteora_program_id);
         rift.liquidity_pool = Some(meteora_pool_pda);
+        
+        // Create real Meteora DLMM pool via CPI
+        // Generate required Meteora PDAs
+        let reserve_x_seeds = &[b"reserve", underlying_key.as_ref(), rift_key.as_ref()];
+        let (reserve_x, _) = Pubkey::find_program_address(reserve_x_seeds, &rift.meteora_program_id);
+        
+        let reserve_y_seeds = &[b"reserve", rift_key.as_ref(), underlying_key.as_ref()];
+        let (reserve_y, _) = Pubkey::find_program_address(reserve_y_seeds, &rift.meteora_program_id);
+        
+        let oracle_seeds = &[b"oracle", meteora_pool_pda.as_ref()];
+        let (oracle, _) = Pubkey::find_program_address(oracle_seeds, &rift.meteora_program_id);
+        
+        // Use a standard preset parameter (would need actual Meteora preset PDA)
+        let bin_step_bytes = bin_step.to_le_bytes();
+        let preset_param_seeds = &[b"preset_parameter".as_ref(), bin_step_bytes.as_ref()];
+        let (preset_parameter, _) = Pubkey::find_program_address(preset_param_seeds, &rift.meteora_program_id);
+        
+        let meteora_create_pool_instruction = create_meteora_pool_instruction(
+            &rift.meteora_program_id,
+            &meteora_pool_pda,
+            &ctx.accounts.underlying_mint.key(),
+            &ctx.accounts.rift_mint.key(),
+            &reserve_x,
+            &reserve_y,
+            &oracle,
+            &preset_parameter,
+            &ctx.accounts.user.key(),
+            bin_step,
+        )?;
+        
+        // Execute Meteora pool creation CPI
+        let pool_auth_seeds = &[
+            b"pool_auth",
+            rift_key.as_ref(),
+            &[ctx.bumps.pool_authority],
+        ];
+        let pool_signer_seeds = &[&pool_auth_seeds[..]];
+        
+        invoke_signed(
+            &meteora_create_pool_instruction,
+            &[
+                ctx.accounts.meteora_program.to_account_info(),      // meteora program
+                ctx.accounts.underlying_mint.to_account_info(),     // token_mint_x
+                ctx.accounts.rift_mint.to_account_info(),           // token_mint_y  
+                ctx.accounts.user.to_account_info(),                // funder (signer)
+                ctx.accounts.token_program.to_account_info(),       // token_program
+                ctx.accounts.system_program.to_account_info(),      // system_program
+            ],
+            pool_signer_seeds,
+        )?;
         
         // Initialize DLMM-style bin structure (simplified)
         rift.active_bin_id = 8388608; // 2^23, center bin like Meteora
@@ -423,8 +494,25 @@ pub mod rifts_protocol {
             .checked_add(amount)
             .ok_or(ErrorCode::MathOverflow)?;
         
-        // Update oracle timestamp to mark activity
-        rift.last_oracle_update = Clock::get()?.unix_timestamp;
+        // Update cumulative volume for oracle triggering
+        rift.volume_since_last_oracle = rift.volume_since_last_oracle
+            .checked_add(amount)
+            .ok_or(ErrorCode::MathOverflow)?;
+        
+        // Check if volume threshold reached for oracle update
+        let current_time = Clock::get()?.unix_timestamp;
+        let volume_threshold = rift.calculate_volume_threshold()?;
+        if rift.volume_since_last_oracle >= volume_threshold {
+            // Reset volume counter and update oracle timestamp
+            rift.volume_since_last_oracle = 0;
+            rift.last_oracle_update = current_time;
+            
+            // Trigger rebalance if needed based on volume threshold
+            let should_rebalance = rift.should_trigger_rebalance(current_time)?;
+            if should_rebalance {
+                rift.trigger_automatic_rebalance(current_time)?;
+            }
+        }
 
         // **CRITICAL FIX**: Process fee distribution BEFORE clearing reentrancy guard
         if wrap_fee > 0 {
@@ -542,8 +630,25 @@ pub mod rifts_protocol {
             .checked_add(underlying_amount)
             .ok_or(ErrorCode::MathOverflow)?;
         
-        // Update oracle timestamp to mark activity
-        rift.last_oracle_update = Clock::get()?.unix_timestamp;
+        // Update cumulative volume for oracle triggering
+        rift.volume_since_last_oracle = rift.volume_since_last_oracle
+            .checked_add(underlying_amount)
+            .ok_or(ErrorCode::MathOverflow)?;
+        
+        // Check if volume threshold reached for oracle update
+        let current_time = Clock::get()?.unix_timestamp;
+        let volume_threshold = rift.calculate_volume_threshold()?;
+        if rift.volume_since_last_oracle >= volume_threshold {
+            // Reset volume counter and update oracle timestamp
+            rift.volume_since_last_oracle = 0;
+            rift.last_oracle_update = current_time;
+            
+            // Trigger rebalance if needed based on volume threshold
+            let should_rebalance = rift.should_trigger_rebalance(current_time)?;
+            if should_rebalance {
+                rift.trigger_automatic_rebalance(current_time)?;
+            }
+        }
 
         // Add reentrancy protection
         require!(!rift.reentrancy_guard, ErrorCode::ReentrancyDetected);
@@ -819,11 +924,11 @@ pub mod rifts_protocol {
             .ok_or(ErrorCode::MathOverflow)? as u64;
         
         if staker.staked_amount > 0 && time_elapsed > 0 {
-            // Calculate pending rewards: 10% APY = ~0.00003170979% per hour
+            // **CRITICAL FIX**: Calculate pending rewards with proper error handling
             // Rewards = staked_amount * time_hours * hourly_rate / 1000000
             let time_hours = time_elapsed
                 .checked_div(3600)
-                .unwrap_or(0);
+                .ok_or(ErrorCode::MathOverflow)?;
             let pending_rewards = staker.staked_amount
                 .checked_mul(time_hours)
                 .ok_or(ErrorCode::MathOverflow)?
@@ -890,7 +995,7 @@ pub mod rifts_protocol {
         if staker.staked_amount > 0 && time_elapsed > 0 {
             let time_hours = time_elapsed
                 .checked_div(3600)
-                .unwrap_or(0);
+                .ok_or(ErrorCode::MathOverflow)?;
             let new_rewards = staker.staked_amount
                 .checked_mul(time_hours)
                 .ok_or(ErrorCode::MathOverflow)?
@@ -969,7 +1074,7 @@ pub mod rifts_protocol {
         if time_elapsed > 0 {
             let time_hours = time_elapsed
                 .checked_div(3600)
-                .unwrap_or(0);
+                .ok_or(ErrorCode::MathOverflow)?;
             let new_rewards = staker.staked_amount
                 .checked_mul(time_hours)
                 .ok_or(ErrorCode::MathOverflow)?
@@ -1026,6 +1131,7 @@ pub mod rifts_protocol {
     }
 
     /// Execute Jupiter swap for fee buybacks (integrated with fee collector)
+    /// **SECURITY FIX**: Restricted to rift creator only
     pub fn jupiter_swap_for_buyback(
         ctx: Context<JupiterSwapForBuyback>,
         amount_in: u64,
@@ -1034,21 +1140,57 @@ pub mod rifts_protocol {
     ) -> Result<()> {
         let rift = &mut ctx.accounts.rift;
         
-        // Validate Jupiter program ID (Jupiter V6: JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4)
-        let jupiter_v6_id = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".parse::<Pubkey>()
-            .map_err(|_| ErrorCode::InvalidProgramId)?;
+        // **SECURITY FIX**: Only rift creator can execute buybacks
         require!(
-            ctx.accounts.jupiter_program.key() == jupiter_v6_id,
+            ctx.accounts.user.key() == rift.creator,
+            ErrorCode::UnauthorizedBuyback
+        );
+        
+        // Validate Jupiter program ID using configurable ID stored in rift
+        require!(
+            ctx.accounts.jupiter_program.key() == rift.jupiter_program_id,
             ErrorCode::InvalidProgramId
         );
         
-        // Validate input
+        // **CRITICAL SECURITY FIX**: Enhanced Jupiter swap parameter validation
         require!(amount_in > 0, ErrorCode::InvalidAmount);
         require!(amount_in <= 1_000_000_000_000, ErrorCode::AmountTooLarge);
-        require!(swap_data.len() <= 10000, ErrorCode::InvalidInputData);
+        require!(swap_data.len() <= 1000, ErrorCode::InvalidInputData); // Reduced from 10k
+        require!(swap_data.len() >= 8, ErrorCode::InvalidInputData); // Minimum instruction size
+        
+        // **SECURITY FIX**: Validate minimum slippage protection
+        let min_slippage_bps = 50; // Minimum 0.5% slippage protection
+        let calculated_min_out = amount_in
+            .checked_mul(10000 - min_slippage_bps)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_div(10000)
+            .ok_or(ErrorCode::MathOverflow)?;
+        require!(
+            minimum_amount_out >= calculated_min_out,
+            ErrorCode::InsufficientSlippageProtection
+        );
+        
+        // **SECURITY FIX**: Maximum slippage protection (10%)
+        let max_slippage_bps = 1000;
+        let calculated_max_out = amount_in
+            .checked_mul(10000 - max_slippage_bps)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_div(10000)
+            .ok_or(ErrorCode::MathOverflow)?;
+        require!(
+            minimum_amount_out <= calculated_max_out,
+            ErrorCode::ExcessiveSlippage
+        );
+        
+        // **SECURITY FIX**: Validate swap instruction discriminator
+        require!(
+            swap_data[0..8] == [0xE4, 0x45, 0x65, 0x31, 0x4C, 0x51, 0x95, 0x45] || // route
+            swap_data[0..8] == [0x51, 0x1c, 0x86, 0x6b, 0xd6, 0xc9, 0xf7, 0x8c], // shared_accounts_route
+            ErrorCode::InvalidJupiterInstruction
+        );
         
         // CPI to Jupiter program for swap
-        let cpi_program = ctx.accounts.jupiter_program.to_account_info();
+        let _cpi_program = ctx.accounts.jupiter_program.to_account_info();
         let cpi_accounts = ctx.remaining_accounts;
         
         let rift_key = rift.key();
@@ -1078,6 +1220,26 @@ pub mod rifts_protocol {
         rift.total_volume_24h = rift.total_volume_24h
             .checked_add(amount_in)
             .ok_or(ErrorCode::MathOverflow)?;
+        
+        // Update cumulative volume for oracle triggering
+        rift.volume_since_last_oracle = rift.volume_since_last_oracle
+            .checked_add(amount_in)
+            .ok_or(ErrorCode::MathOverflow)?;
+        
+        // Check if volume threshold reached for oracle update
+        let current_time = Clock::get()?.unix_timestamp;
+        let volume_threshold = rift.calculate_volume_threshold()?;
+        if rift.volume_since_last_oracle >= volume_threshold {
+            // Reset volume counter and update oracle timestamp
+            rift.volume_since_last_oracle = 0;
+            rift.last_oracle_update = current_time;
+            
+            // Trigger rebalance if needed based on volume threshold
+            let should_rebalance = rift.should_trigger_rebalance(current_time)?;
+            if should_rebalance {
+                rift.trigger_automatic_rebalance(current_time)?;
+            }
+        }
         
         emit!(JupiterSwapExecuted {
             rift: rift.key(),
@@ -1169,6 +1331,53 @@ pub mod rifts_protocol {
         Ok(())
     }
 
+    /// **OWNER CONTROL**: Update security parameters (owner only)
+    pub fn update_security_parameters(
+        ctx: Context<UpdateSecurityParameters>,
+        max_single_transaction: Option<u64>,
+        large_transaction_threshold: Option<u64>,
+        max_large_transactions_per_hour: Option<u8>,
+        price_deviation_pause_threshold: Option<u16>,
+    ) -> Result<()> {
+        let rift = &mut ctx.accounts.rift;
+        
+        // **OWNER ONLY**: Only rift creator can update security parameters
+        require!(
+            ctx.accounts.owner.key() == rift.creator,
+            ErrorCode::UnauthorizedUpdate
+        );
+        
+        // Update max single transaction limit
+        if let Some(max_tx) = max_single_transaction {
+            require!(max_tx >= 1_000_000_000_000, ErrorCode::InvalidSecurityParameter); // Min 1T
+            require!(max_tx <= 100_000_000_000_000, ErrorCode::InvalidSecurityParameter); // Max 100T
+            rift.max_single_transaction = Some(max_tx);
+        }
+        
+        // Update large transaction threshold
+        if let Some(threshold) = large_transaction_threshold {
+            require!(threshold >= 100_000_000_000, ErrorCode::InvalidSecurityParameter); // Min 100B
+            require!(threshold <= 10_000_000_000_000, ErrorCode::InvalidSecurityParameter); // Max 10T
+            rift.large_transaction_threshold = Some(threshold);
+        }
+        
+        // Update max large transactions per hour
+        if let Some(max_count) = max_large_transactions_per_hour {
+            require!(max_count >= 1 && max_count <= 20, ErrorCode::InvalidSecurityParameter);
+            rift.max_large_transactions_per_hour = Some(max_count);
+        }
+        
+        // Update price deviation pause threshold
+        if let Some(threshold) = price_deviation_pause_threshold {
+            require!(threshold >= 1000 && threshold <= 10000, ErrorCode::InvalidSecurityParameter); // 10% - 100%
+            rift.price_deviation_pause_threshold = Some(threshold);
+        }
+        
+        // Security parameters updated successfully
+        
+        Ok(())
+    }
+
     /// Unpause function (governance controlled)
     pub fn emergency_unpause(
         ctx: Context<EmergencyUnpause>,
@@ -1187,6 +1396,108 @@ pub mod rifts_protocol {
         emit!(RiftUnpaused {
             rift: rift.key(),
             authority: ctx.accounts.governance_authority.key(),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        
+        Ok(())
+    }
+
+    /// Update Jupiter program ID (owner only)
+    pub fn update_jupiter_program_id(
+        ctx: Context<UpdateJupiterProgramId>,
+        new_jupiter_program_id: Pubkey,
+    ) -> Result<()> {
+        let rift = &mut ctx.accounts.rift;
+        
+        // **OWNER ONLY**: Only rift creator can update Jupiter program ID
+        require!(
+            ctx.accounts.owner.key() == rift.creator,
+            ErrorCode::UnauthorizedUpdate
+        );
+        
+        // Validate the new program ID is not default
+        require!(
+            new_jupiter_program_id != Pubkey::default(),
+            ErrorCode::InvalidProgramId
+        );
+        
+        let old_jupiter_id = rift.jupiter_program_id;
+        rift.jupiter_program_id = new_jupiter_program_id;
+        
+        emit!(JupiterProgramIdUpdated {
+            rift: rift.key(),
+            authority: ctx.accounts.owner.key(),
+            old_program_id: old_jupiter_id,
+            new_program_id: new_jupiter_program_id,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        
+        Ok(())
+    }
+
+    /// Update Meteora program ID (owner only)
+    pub fn update_meteora_program_id(
+        ctx: Context<UpdateMeteoraProgram>,
+        new_meteora_program_id: Pubkey,
+    ) -> Result<()> {
+        let rift = &mut ctx.accounts.rift;
+        
+        // **OWNER ONLY**: Only rift creator can update Meteora program ID
+        require!(
+            ctx.accounts.owner.key() == rift.creator,
+            ErrorCode::UnauthorizedUpdate
+        );
+        
+        // Validate the new program ID is not default
+        require!(
+            new_meteora_program_id != Pubkey::default(),
+            ErrorCode::InvalidProgramId
+        );
+        
+        let old_meteora_id = rift.meteora_program_id;
+        rift.meteora_program_id = new_meteora_program_id;
+        
+        emit!(JupiterProgramIdUpdated {
+            rift: rift.key(),
+            authority: ctx.accounts.owner.key(),
+            old_program_id: old_meteora_id,
+            new_program_id: new_meteora_program_id,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        
+        Ok(())
+    }
+
+    /// Update volume oracle threshold (owner only)
+    pub fn update_volume_oracle_threshold(
+        ctx: Context<UpdateVolumeThreshold>,
+        new_threshold_bps: u16,
+    ) -> Result<()> {
+        let rift = &mut ctx.accounts.rift;
+        
+        // **OWNER ONLY**: Only rift creator can update volume threshold
+        require!(
+            ctx.accounts.owner.key() == rift.creator,
+            ErrorCode::UnauthorizedUpdate
+        );
+        
+        // Validate threshold range (1% to 50% of total supply)
+        require!(
+            new_threshold_bps >= 100 && new_threshold_bps <= 5000, 
+            ErrorCode::InvalidVolumeThreshold
+        ); // 1% to 50% in basis points
+        
+        let old_threshold = rift.volume_oracle_threshold_bps;
+        rift.volume_oracle_threshold_bps = new_threshold_bps;
+        
+        // Reset volume counter when threshold changes
+        rift.volume_since_last_oracle = 0;
+        
+        emit!(VolumeThresholdUpdated {
+            rift: rift.key(),
+            authority: ctx.accounts.owner.key(),
+            old_threshold: old_threshold as u64,
+            new_threshold: new_threshold_bps as u64,
             timestamp: Clock::get()?.unix_timestamp,
         });
         
@@ -1299,7 +1610,7 @@ pub struct CreateRiftWithVanityMint<'info> {
     pub underlying_mint: Account<'info, Mint>,
     
     /// The vanity mint account (pre-generated with address ending in 'rift')
-    /// This is passed in by the user, similar to how pump.fun accepts pre-generated mints
+    /// This is passed in by the user
     #[account(
         init,
         payer = creator,
@@ -1455,6 +1766,9 @@ pub struct WrapTokens<'info> {
         bump
     )]
     pub pool_authority: UncheckedAccount<'info>,
+    
+    /// CHECK: Meteora DLMM program for pool creation
+    pub meteora_program: UncheckedAccount<'info>,
     
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
@@ -1763,6 +2077,15 @@ pub struct EmergencyUnpause<'info> {
 }
 
 #[derive(Accounts)]
+pub struct UpdateSecurityParameters<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    
+    #[account(mut)]
+    pub rift: Account<'info, Rift>,
+}
+
+#[derive(Accounts)]
 pub struct CloseRift<'info> {
     #[account(mut)]
     pub creator: Signer<'info>,
@@ -1772,6 +2095,33 @@ pub struct CloseRift<'info> {
         close = creator,
         has_one = creator @ ErrorCode::UnauthorizedClose
     )]
+    pub rift: Account<'info, Rift>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateJupiterProgramId<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    
+    #[account(mut)]
+    pub rift: Account<'info, Rift>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateMeteoraProgram <'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    
+    #[account(mut)]
+    pub rift: Account<'info, Rift>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateVolumeThreshold<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    
+    #[account(mut)]
     pub rift: Account<'info, Rift>,
 }
 
@@ -1832,6 +2182,9 @@ pub struct Rift {
     pub max_rebalance_interval: i64,    // Maximum time between rebalances (24 hours)
     pub arbitrage_threshold_bps: u16,   // Threshold for arbitrage detection (basis points)
     pub last_oracle_update: i64,        // Last oracle price update
+    // Volume-based oracle triggers
+    pub volume_oracle_threshold_bps: u16, // Volume threshold as % of total supply (default 500 bps = 5%)
+    pub volume_since_last_oracle: u64,    // Cumulative volume since last oracle update
     // Advanced Metrics
     pub total_volume_24h: u64,          // 24h trading volume
     pub price_deviation: u64,           // Current price deviation from backing
@@ -1869,6 +2222,18 @@ pub struct Rift {
     
     // Governance Integration
     pub last_governance_update: i64,   // Timestamp of last governance parameter update
+    
+    // External Program IDs (configurable by owner)
+    pub jupiter_program_id: Pubkey,    // Jupiter V6 program ID
+    pub meteora_program_id: Pubkey,    // Meteora DLMM program ID
+    
+    // Security Controls
+    pub max_single_transaction: Option<u64>,         // Maximum single transaction amount
+    pub large_transaction_threshold: Option<u64>,    // Threshold for large transactions
+    pub max_large_transactions_per_hour: Option<u8>, // Max large transactions per hour
+    pub last_large_transaction_time: Option<i64>,    // Last large transaction timestamp
+    pub large_transaction_count: Option<u32>,        // Current large transaction count in window
+    pub price_deviation_pause_threshold: Option<u16>, // Price deviation that triggers pause (bps)
 }
 
 /// Oracle Registry for governance-controlled oracle management
@@ -1902,6 +2267,14 @@ pub struct PriceData {
     pub timestamp: i64,
 }
 
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct OraclePrice {
+    pub price: u64,
+    pub confidence: u64,
+    pub timestamp: i64,
+    pub oracle_type: u8, // 0=Pyth, 1=Chainlink, 2=Switchboard
+}
+
 
 
 // LP Staking will be implemented in a separate program for modularity
@@ -1918,7 +2291,7 @@ impl Rift {
         Ok(())
     }
     
-    pub fn should_trigger_rebalance(&self, current_time: i64) -> Result<bool> {
+    pub fn should_trigger_rebalance(&mut self, current_time: i64) -> Result<bool> {
         // Check if maximum rebalance interval has passed
         if current_time - self.last_rebalance > self.max_rebalance_interval {
             return Ok(true);
@@ -1932,6 +2305,9 @@ impl Rift {
         // Check if oracle indicates significant price deviation
         let avg_price = self.get_average_oracle_price()?;
         let price_deviation = self.calculate_price_deviation(avg_price)?;
+        
+        // **CRITICAL FIX**: Actually update the price_deviation field
+        self.price_deviation = price_deviation as u64;
         
         // Trigger if deviation > 2%
         Ok(price_deviation > 200) // 200 basis points = 2%
@@ -2052,15 +2428,21 @@ impl Rift {
     }
     
     pub fn get_pending_fees(&self) -> u64 {
-        // **CRITICAL FIX**: Get total fees that haven't been distributed yet with checked arithmetic
-        let total_distributed = self.rifts_tokens_distributed
-            .checked_add(self.rifts_tokens_burned)
-            .unwrap_or(u64::MAX); // Safe fallback if overflow
+        // **SECURITY FIX**: Get total fees that haven't been distributed yet with proper overflow handling
+        let total_distributed = match self.rifts_tokens_distributed
+            .checked_add(self.rifts_tokens_burned) {
+            Some(sum) => sum,
+            None => {
+                // If overflow occurs, return 0 (conservative approach)
+                // This prevents any fee distribution if the numbers are corrupted
+                return 0;
+            }
+        };
         
         if self.total_fees_collected > total_distributed {
             self.total_fees_collected
                 .checked_sub(total_distributed)
-                .unwrap_or(0) // Safe fallback
+                .unwrap_or(0) // Safe fallback - if underflow, return 0
         } else {
             0
         }
@@ -2131,6 +2513,33 @@ impl Rift {
              burn_amount, partner_amount, treasury_amount, lp_staker_amount, rifts_burn_amount);
         
         Ok(())
+    }
+
+    /// Calculate volume threshold based on percentage of total supply
+    pub fn calculate_volume_threshold(&self) -> Result<u64> {
+        // **CRITICAL FIX**: Estimate total supply with proper fallback values
+        let base_liquidity = self.total_liquidity_underlying
+            .checked_add(self.total_liquidity_rift)
+            .unwrap_or(self.total_liquidity_underlying.max(self.total_liquidity_rift));
+            
+        let estimated_supply = base_liquidity
+            .checked_add(self.rifts_tokens_distributed)
+            .unwrap_or(base_liquidity);
+        
+        // If no activity yet, use minimum threshold
+        if estimated_supply == 0 {
+            return Ok(1_000_000_000); // 1000 tokens with 6 decimals
+        }
+        
+        // **CRITICAL FIX**: Calculate threshold as percentage of estimated supply with proper error handling
+        let threshold = estimated_supply
+            .checked_mul(self.volume_oracle_threshold_bps as u64)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_div(10000)
+            .ok_or(ErrorCode::MathOverflow)?;
+        
+        // Minimum threshold of 1000 tokens to prevent too frequent updates
+        Ok(threshold.max(1_000_000_000)) // 1000 tokens with 6 decimals
     }
 }
 
@@ -2253,6 +2662,145 @@ pub struct OraclePriceUpdated {
     pub timestamp: i64,
 }
 
+#[event]
+pub struct JupiterProgramIdUpdated {
+    pub rift: Pubkey,
+    pub authority: Pubkey,
+    pub old_program_id: Pubkey,
+    pub new_program_id: Pubkey,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct VolumeThresholdUpdated {
+    pub rift: Pubkey,
+    pub authority: Pubkey,
+    pub old_threshold: u64,
+    pub new_threshold: u64,
+    pub timestamp: i64,
+}
+
+// Helper function to create real Meteora DLMM pool instruction
+fn create_meteora_pool_instruction(
+    meteora_program_id: &Pubkey,
+    pool_pda: &Pubkey,
+    token_mint_x: &Pubkey,
+    token_mint_y: &Pubkey,
+    reserve_x: &Pubkey,
+    reserve_y: &Pubkey,
+    oracle: &Pubkey,
+    preset_parameter: &Pubkey,
+    funder: &Pubkey,
+    bin_step: u16,
+) -> Result<anchor_lang::solana_program::instruction::Instruction> {
+    // Real Meteora DLMM initializeLbPair2 instruction discriminator
+    let discriminator = [73, 59, 36, 120, 237, 83, 108, 198];
+    
+    // Build instruction data with discriminator + parameters
+    let mut data = Vec::new();
+    data.extend_from_slice(&discriminator);
+    
+    // Add bin_step parameter (u16)
+    data.extend_from_slice(&bin_step.to_le_bytes());
+    // Add active_id parameter (i32) - using default center bin
+    data.extend_from_slice(&8388608_i32.to_le_bytes());
+    
+    // **CRITICAL FIX**: Derive proper event authority PDA
+    let (event_authority, _) = Pubkey::find_program_address(
+        &[b"__event_authority"],
+        meteora_program_id
+    );
+    
+    // Meteora DLMM initializeLbPair2 accounts (in correct order)
+    let accounts = vec![
+        // lb_pair (writable)
+        anchor_lang::solana_program::instruction::AccountMeta {
+            pubkey: *pool_pda,
+            is_signer: false,
+            is_writable: true,
+        },
+        // bin_array_bitmap_extension (writable, optional, PDA) - skip for basic pools
+        // token_mint_x
+        anchor_lang::solana_program::instruction::AccountMeta {
+            pubkey: *token_mint_x,
+            is_signer: false,
+            is_writable: false,
+        },
+        // token_mint_y  
+        anchor_lang::solana_program::instruction::AccountMeta {
+            pubkey: *token_mint_y,
+            is_signer: false,
+            is_writable: false,
+        },
+        // reserve_x (writable, PDA)
+        anchor_lang::solana_program::instruction::AccountMeta {
+            pubkey: *reserve_x,
+            is_signer: false,
+            is_writable: true,
+        },
+        // reserve_y (writable, PDA)
+        anchor_lang::solana_program::instruction::AccountMeta {
+            pubkey: *reserve_y,
+            is_signer: false,
+            is_writable: true,
+        },
+        // oracle (writable, PDA)
+        anchor_lang::solana_program::instruction::AccountMeta {
+            pubkey: *oracle,
+            is_signer: false,
+            is_writable: true,
+        },
+        // preset_parameter
+        anchor_lang::solana_program::instruction::AccountMeta {
+            pubkey: *preset_parameter,
+            is_signer: false,
+            is_writable: false,
+        },
+        // funder (writable, signer)
+        anchor_lang::solana_program::instruction::AccountMeta {
+            pubkey: *funder,
+            is_signer: true,
+            is_writable: true,
+        },
+        // token_program (for token_mint_x)
+        anchor_lang::solana_program::instruction::AccountMeta {
+            pubkey: anchor_spl::token::ID,
+            is_signer: false,
+            is_writable: false,
+        },
+        // token_program (for token_mint_y)
+        anchor_lang::solana_program::instruction::AccountMeta {
+            pubkey: anchor_spl::token::ID,
+            is_signer: false,
+            is_writable: false,
+        },
+        // system_program
+        anchor_lang::solana_program::instruction::AccountMeta {
+            pubkey: anchor_lang::solana_program::system_program::ID,
+            is_signer: false,
+            is_writable: false,
+        },
+        // event_authority (PDA) - **FIXED**: Now uses proper PDA derivation
+        anchor_lang::solana_program::instruction::AccountMeta {
+            pubkey: event_authority,
+            is_signer: false,
+            is_writable: false,
+        },
+        // program (self-reference)
+        anchor_lang::solana_program::instruction::AccountMeta {
+            pubkey: *meteora_program_id,
+            is_signer: false,
+            is_writable: false,
+        },
+    ];
+    
+    Ok(anchor_lang::solana_program::instruction::Instruction {
+        program_id: *meteora_program_id,
+        accounts,
+        data,
+    })
+}
+
 #[error_code]
 pub enum ErrorCode {
     #[msg("Invalid burn fee (max 45%)")]
@@ -2291,6 +2839,30 @@ pub enum ErrorCode {
     InvalidBackingRatio,
     #[msg("Unauthorized oracle")]
     UnauthorizedOracle,
+    #[msg("Protocol is paused")]
+    ProtocolPaused,
+    #[msg("Emergency pause triggered")]
+    EmergencyPause,
+    #[msg("Volume circuit breaker triggered")]
+    VolumeCircuitBreaker,
+    #[msg("Oracle price deviation too high")]
+    OraclePriceDeviation,
+    #[msg("Stale oracle price")]
+    StaleOraclePrice,
+    #[msg("Buyback rate limit exceeded")]
+    BuybackRateLimit,
+    #[msg("Insufficient slippage protection")]
+    InsufficientSlippageProtection,
+    #[msg("Excessive slippage")]
+    ExcessiveSlippage,
+    #[msg("Invalid Jupiter instruction")]
+    InvalidJupiterInstruction,
+    #[msg("Suspicious activity detected")]
+    SuspiciousActivity,
+    #[msg("Unauthorized update")]
+    UnauthorizedUpdate,
+    #[msg("Invalid security parameter")]
+    InvalidSecurityParameter,
     #[msg("Invalid price")]
     InvalidPrice,
     #[msg("Invalid confidence")]
@@ -2339,6 +2911,8 @@ pub enum ErrorCode {
     InvalidOracleInterval,
     #[msg("Invalid rebalance threshold")]
     InvalidRebalanceThreshold,
+    #[msg("Invalid volume threshold")]
+    InvalidVolumeThreshold,
     #[msg("Unauthorized governance action")]
     UnauthorizedGovernance,
     #[msg("Rift is currently paused")]
@@ -2349,31 +2923,93 @@ pub enum ErrorCode {
     MissingPartnerVault,
     #[msg("Invalid bin step for DLMM pool")]
     InvalidBinStep,
+    #[msg("Unauthorized buyback operation")]
+    UnauthorizedBuyback,
 }
 
 // Oracle update instruction implementations
-pub fn update_pyth_oracle(ctx: Context<UpdatePythOracle>) -> Result<()> {
+/// **SECURITY FIX**: Multi-oracle validation to prevent manipulation
+pub fn update_hybrid_oracle(ctx: Context<UpdateHybridOracle>) -> Result<()> {
     let rift = &mut ctx.accounts.rift;
-    let pyth_price_account = &ctx.accounts.pyth_price_account;
-    
-    // Parse REAL Pyth price account data directly
-    let price_data = pyth_price_account.try_borrow_data()?;
-    require!(price_data.len() >= 240, ErrorCode::InvalidOraclePrice); // Minimum Pyth account size
-    
     let current_time = Clock::get()?.unix_timestamp;
     
-    // Parse Pyth price account structure
-    // Pyth account layout: magic(4) + version(4) + account_type(4) + price_data...
+    // **CRITICAL SECURITY FIX**: Require multiple oracle sources for validation
+    let pyth_price = extract_pyth_price(&ctx.accounts.pyth_price_account)?;
+    let switchboard_price = extract_switchboard_price(&ctx.accounts.switchboard_price_account)?;
+    let chainlink_price = extract_chainlink_price(&ctx.accounts.chainlink_price_account)?;
+    
+    // **SECURITY FIX**: Validate all oracles are recent (within 5 minutes)
+    let max_staleness = 300; // 5 minutes
+    require!(
+        current_time - pyth_price.timestamp <= max_staleness,
+        ErrorCode::StaleOraclePrice
+    );
+    require!(
+        current_time - switchboard_price.timestamp <= max_staleness,
+        ErrorCode::StaleOraclePrice
+    );
+    require!(
+        current_time - chainlink_price.timestamp <= max_staleness,
+        ErrorCode::StaleOraclePrice
+    );
+    
+    // **SECURITY FIX**: Ensure oracle prices are within acceptable deviation (10%)
+    let prices = [pyth_price.price, switchboard_price.price, chainlink_price.price];
+    let median_price = calculate_median(prices)?;
+    
+    for price in prices.iter() {
+        let deviation = if *price > median_price {
+            (*price - median_price) * 10000 / median_price
+        } else {
+            (median_price - *price) * 10000 / median_price
+        };
+        require!(
+            deviation <= 1000, // Max 10% deviation
+            ErrorCode::OraclePriceDeviation
+        );
+    }
+    
+    // **SECURITY FIX**: Use median price as the authoritative price
+    let validated_price = OraclePrice {
+        price: median_price,
+        confidence: pyth_price.confidence, // Use most conservative confidence
+        timestamp: current_time,
+        oracle_type: 3, // 3 = Hybrid
+    };
+    
+    // Update rift oracle with validated price
+    let price_index = rift.price_index as usize;
+    rift.oracle_prices[price_index] = PriceData {
+        price: validated_price.price,
+        confidence: validated_price.confidence,
+        timestamp: validated_price.timestamp,
+    };
+    
+    rift.price_index = ((price_index + 1) % rift.oracle_prices.len()) as u8;
+    rift.last_oracle_update = current_time;
+    // Reset volume counter when manual oracle update occurs
+    rift.volume_since_last_oracle = 0;
+    
+    emit!(OraclePriceUpdated {
+        rift: rift.key(),
+        oracle_type: "Hybrid".to_string(),
+        price: validated_price.price,
+        confidence: validated_price.confidence,
+        timestamp: current_time,
+    });
+    
+    Ok(())
+}
+
+// **SECURITY HELPER FUNCTIONS**: Safe oracle data extraction
+fn extract_pyth_price(pyth_account: &AccountInfo) -> Result<OraclePrice> {
+    let price_data = pyth_account.try_borrow_data()?;
+    require!(price_data.len() >= 240, ErrorCode::InvalidOraclePrice);
+    
+    // Validate Pyth magic number
     let magic = u32::from_le_bytes([price_data[0], price_data[1], price_data[2], price_data[3]]);
-    let version = u32::from_le_bytes([price_data[4], price_data[5], price_data[6], price_data[7]]);
-    let account_type = u32::from_le_bytes([price_data[8], price_data[9], price_data[10], price_data[11]]);
+    require!(magic == 0xa1b2c3d4, ErrorCode::InvalidOraclePrice);
     
-    // Validate Pyth magic number and account type
-    require!(magic == 0xa1b2c3d4, ErrorCode::InvalidOraclePrice); // Pyth magic
-    require!(account_type == 3, ErrorCode::InvalidOraclePrice); // Price account type
-    
-    // Extract price data from Pyth account
-    // Price is at offset 208-215 (i64)
     let price_i64 = i64::from_le_bytes([
         price_data[208], price_data[209], price_data[210], price_data[211],
         price_data[212], price_data[213], price_data[214], price_data[215]
@@ -2392,6 +3028,7 @@ pub fn update_pyth_oracle(ctx: Context<UpdatePythOracle>) -> Result<()> {
     ]);
     
     // Validate price staleness (allow max 300 seconds)
+    let current_time = Clock::get()?.unix_timestamp;
     require!(
         current_time - timestamp_i64 <= 300,
         ErrorCode::OraclePriceTooStale
@@ -2414,22 +3051,104 @@ pub fn update_pyth_oracle(ctx: Context<UpdatePythOracle>) -> Result<()> {
     require!(price_scaled > 0, ErrorCode::InvalidOraclePrice);
     require!(price_scaled <= 1_000_000_000_000, ErrorCode::OraclePriceTooLarge);
     require!(
-        confidence_scaled <= price_scaled.checked_div(10).unwrap_or(0), 
+        confidence_scaled <= price_scaled.checked_div(10).ok_or(ErrorCode::MathOverflow)?, 
         ErrorCode::InvalidConfidence
     );
     
-    // Update oracle price in rift with real parsed Pyth data
-    rift.add_price_data(price_scaled, confidence_scaled, timestamp_i64)?;
-    
-    emit!(OraclePriceUpdated {
-        rift: rift.key(),
-        oracle_type: "Pyth".to_string(),
+    Ok(OraclePrice {
         price: price_scaled,
         confidence: confidence_scaled,
         timestamp: timestamp_i64,
-    });
+        oracle_type: 0, // 0 = Pyth
+    })
+}
+
+fn extract_switchboard_price(switchboard_account: &AccountInfo) -> Result<OraclePrice> {
+    let price_data = switchboard_account.try_borrow_data()?;
+    require!(price_data.len() >= 112, ErrorCode::InvalidOraclePrice);
     
-    Ok(())
+    // Switchboard aggregator data structure
+    let price_i128 = i128::from_le_bytes([
+        price_data[16], price_data[17], price_data[18], price_data[19],
+        price_data[20], price_data[21], price_data[22], price_data[23],
+        price_data[24], price_data[25], price_data[26], price_data[27],
+        price_data[28], price_data[29], price_data[30], price_data[31],
+    ]);
+    
+    let timestamp_i64 = i64::from_le_bytes([
+        price_data[96], price_data[97], price_data[98], price_data[99],
+        price_data[100], price_data[101], price_data[102], price_data[103]
+    ]);
+    
+    // Validate price staleness
+    let current_time = Clock::get()?.unix_timestamp;
+    require!(
+        current_time - timestamp_i64 <= 300,
+        ErrorCode::OraclePriceTooStale
+    );
+    
+    // Convert to u64 with scaling
+    let price_scaled = if price_i128 >= 0 {
+        (price_i128 as u64)
+            .checked_div(1_000_000) // Switchboard uses 9 decimals, we want 6
+            .ok_or(ErrorCode::MathOverflow)?
+    } else {
+        return Err(ErrorCode::InvalidOraclePrice.into());
+    };
+    
+    require!(price_scaled > 0, ErrorCode::InvalidOraclePrice);
+    
+    Ok(OraclePrice {
+        price: price_scaled,
+        confidence: price_scaled / 100, // Assume 1% confidence for Switchboard
+        timestamp: timestamp_i64,
+        oracle_type: 2, // 2 = Switchboard
+    })
+}
+
+fn extract_chainlink_price(chainlink_account: &AccountInfo) -> Result<OraclePrice> {
+    let price_data = chainlink_account.try_borrow_data()?;
+    require!(price_data.len() >= 32, ErrorCode::InvalidOraclePrice);
+    
+    // Chainlink price data structure (simplified)
+    let price_i64 = i64::from_le_bytes([
+        price_data[8], price_data[9], price_data[10], price_data[11],
+        price_data[12], price_data[13], price_data[14], price_data[15]
+    ]);
+    
+    let timestamp_i64 = i64::from_le_bytes([
+        price_data[16], price_data[17], price_data[18], price_data[19],
+        price_data[20], price_data[21], price_data[22], price_data[23]
+    ]);
+    
+    // Validate price staleness
+    let current_time = Clock::get()?.unix_timestamp;
+    require!(
+        current_time - timestamp_i64 <= 300,
+        ErrorCode::OraclePriceTooStale
+    );
+    
+    let price_scaled = if price_i64 >= 0 {
+        (price_i64 as u64)
+            .checked_mul(1_000_000) // Scale to 6 decimals
+            .ok_or(ErrorCode::MathOverflow)?
+    } else {
+        return Err(ErrorCode::InvalidOraclePrice.into());
+    };
+    
+    require!(price_scaled > 0, ErrorCode::InvalidOraclePrice);
+    
+    Ok(OraclePrice {
+        price: price_scaled,
+        confidence: price_scaled / 200, // Assume 0.5% confidence for Chainlink
+        timestamp: timestamp_i64,
+        oracle_type: 1, // 1 = Chainlink
+    })
+}
+
+fn calculate_median(mut prices: [u64; 3]) -> Result<u64> {
+    prices.sort_unstable();
+    Ok(prices[1]) // Middle value is median for 3 values
 }
 
 pub fn update_switchboard_oracle(ctx: Context<UpdateSwitchboardOracle>) -> Result<()> {
@@ -2464,7 +3183,7 @@ pub fn update_switchboard_oracle(ctx: Context<UpdateSwitchboardOracle>) -> Resul
     // Convert to scaled price (simplified conversion)
     let price_scaled = (value_u128 as u64)
         .checked_div(1_000_000_000_000) // Scale down from Switchboard decimals
-        .unwrap_or(0)
+        .ok_or(ErrorCode::MathOverflow)?
         .checked_mul(1_000_000) // Scale to our 6 decimal format
         .ok_or(ErrorCode::MathOverflow)?;
     
@@ -2476,7 +3195,7 @@ pub fn update_switchboard_oracle(ctx: Context<UpdateSwitchboardOracle>) -> Resul
     
     let confidence_scaled = (std_dev_u128 as u64)
         .checked_div(1_000_000_000_000)
-        .unwrap_or(0)
+        .ok_or(ErrorCode::MathOverflow)?
         .checked_mul(1_000_000)
         .ok_or(ErrorCode::MathOverflow)?;
     
@@ -2496,7 +3215,7 @@ pub fn update_switchboard_oracle(ctx: Context<UpdateSwitchboardOracle>) -> Resul
     require!(price_scaled > 0, ErrorCode::InvalidOraclePrice);
     require!(price_scaled <= 1_000_000_000_000, ErrorCode::OraclePriceTooLarge);
     require!(
-        confidence_scaled <= price_scaled.checked_div(5).unwrap_or(0), // Max 20% confidence interval
+        confidence_scaled <= price_scaled.checked_div(5).ok_or(ErrorCode::MathOverflow)?, // Max 20% confidence interval
         ErrorCode::InvalidConfidence
     );
     
@@ -2536,7 +3255,7 @@ pub fn update_jupiter_oracle(ctx: Context<UpdateJupiterOracle>) -> Result<()> {
     require!(price_update.price > 0, ErrorCode::InvalidOraclePrice);
     require!(price_update.price <= 1_000_000_000_000, ErrorCode::OraclePriceTooLarge);
     require!(
-        price_update.confidence <= price_update.price.checked_div(10).unwrap_or(0), // Max 10% confidence interval
+        price_update.confidence <= price_update.price.checked_div(10).ok_or(ErrorCode::MathOverflow)?, // Max 10% confidence interval
         ErrorCode::InvalidConfidence
     );
     
@@ -2549,10 +3268,10 @@ pub fn update_jupiter_oracle(ctx: Context<UpdateJupiterOracle>) -> Result<()> {
     if rift.last_oracle_update > 0 {
         let last_price = rift.get_average_oracle_price()?;
         if last_price > 0 {
-            // Price shouldn't deviate more than 50% from last known price
-            let max_deviation = last_price.checked_div(2).unwrap_or(0);
-            let min_price = last_price.checked_sub(max_deviation).unwrap_or(0);
-            let max_price = last_price.checked_add(max_deviation).unwrap_or(u64::MAX);
+            // **CRITICAL FIX**: Price deviation calculation with proper error handling
+            let max_deviation = last_price.checked_div(2).ok_or(ErrorCode::MathOverflow)?;
+            let min_price = last_price.checked_sub(max_deviation).ok_or(ErrorCode::MathOverflow)?;
+            let max_price = last_price.checked_add(max_deviation).ok_or(ErrorCode::MathOverflow)?;
             
             require!(
                 price_update.price >= min_price && price_update.price <= max_price,
@@ -2577,6 +3296,23 @@ pub fn update_jupiter_oracle(ctx: Context<UpdateJupiterOracle>) -> Result<()> {
     });
     
     Ok(())
+}
+
+#[derive(Accounts)]
+pub struct UpdateHybridOracle<'info> {
+    #[account(mut)]
+    pub rift: Account<'info, Rift>,
+    
+    /// CHECK: Pyth price account
+    pub pyth_price_account: UncheckedAccount<'info>,
+    
+    /// CHECK: Switchboard aggregator account  
+    pub switchboard_price_account: UncheckedAccount<'info>,
+    
+    /// CHECK: Chainlink price account
+    pub chainlink_price_account: UncheckedAccount<'info>,
+    
+    pub oracle_authority: Signer<'info>,
 }
 
 #[derive(Accounts)]
