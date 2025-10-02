@@ -12,7 +12,7 @@ pub use governance;
 pub use lp_staking;
 
 // Internal modules
-mod jupiter;
+// mod jupiter; // Removed - Jupiter integration implemented inline (lines 1851-1918)
 
 // Meteora DAMM v2 imports
 use cp_amm::program::CpAmm;
@@ -29,156 +29,6 @@ pub const METEORA_DAMM_V2_PROGRAM_ID: Pubkey = pubkey!("cpamdpZCGKUy5JxQXB4dcpGP
 #[program]
 pub mod rifts_protocol {
     use super::*;
-
-    /// Create a new Rift with a vanity mint address (like pump.fun does with 'pump')
-    /// This allows creating rifts with mint addresses ending in 'rift'
-    pub fn create_rift_with_vanity_mint(
-        ctx: Context<CreateRiftWithVanityMint>,
-        burn_fee_bps: u16,
-        partner_fee_bps: u16,
-        partner_wallet: Option<Pubkey>,
-        rift_name: [u8; 32],
-        name_len: u8,
-    ) -> Result<()> {
-        let rift = &mut ctx.accounts.rift;
-        
-        // Validate fees
-        require!(burn_fee_bps <= 4500, ErrorCode::InvalidBurnFee);
-        require!(partner_fee_bps <= 500, ErrorCode::InvalidPartnerFee);
-        
-        // Validate that the mint address ends with 'rift' (case insensitive)
-        let mint_address = ctx.accounts.rift_mint.key().to_string();
-        let lower_address = mint_address.to_lowercase();
-        require!(
-            lower_address.ends_with("rift") ||
-            lower_address.ends_with("rifts") ||
-            lower_address.ends_with("rift1") ||
-            lower_address.ends_with("rift2") ||
-            lower_address.ends_with("rift3") ||
-            lower_address.ends_with("rift4") ||
-            lower_address.ends_with("rift5") ||
-            lower_address.ends_with("rift6") ||
-            lower_address.ends_with("rift7") ||
-            lower_address.ends_with("rift8") ||
-            lower_address.ends_with("rift9") ||
-            lower_address.ends_with("rft"),
-            ErrorCode::InvalidVanityAddress
-        );
-        
-        // Set rift name (fixed-size array - no heap allocation!)
-        require!(name_len <= 32, ErrorCode::NameTooLong);
-        if name_len > 0 {
-            rift.name[..name_len as usize].copy_from_slice(&rift_name[..name_len as usize]);
-        } else {
-            // Default: empty name (all zeros)
-            rift.name = [0u8; 32];
-        }
-
-        rift.creator = ctx.accounts.creator.key();
-        rift.underlying_mint = ctx.accounts.underlying_mint.key();
-        rift.rift_mint = ctx.accounts.rift_mint.key();
-        
-        // **SECURITY FIX**: Create vault PDA with consistent seeds
-        let rift_key = rift.key();
-        let vault_seeds = &[b"vault", rift_key.as_ref()];
-        let (vault_pda, _) = Pubkey::find_program_address(vault_seeds, &crate::ID);
-        rift.vault = vault_pda;
-        
-        rift.burn_fee_bps = burn_fee_bps;
-        rift.partner_fee_bps = partner_fee_bps;
-        rift.partner_wallet = partner_wallet;
-        rift.total_underlying_wrapped = 0;
-        rift.total_rift_minted = 0;
-        rift.total_burned = 0;
-        rift.backing_ratio = 10000;
-        rift.last_rebalance = Clock::get()?.unix_timestamp;
-        rift.created_at = Clock::get()?.unix_timestamp;
-        
-        // **SECURITY FIX**: Initialize hybrid oracle system with valid initial state
-        let current_time = Clock::get()?.unix_timestamp;
-
-        // Initialize with realistic default price and confidence instead of zero values
-        let initial_price_data = PriceData {
-            price: 1_000_000, // Default to 1.0 price (with 6 decimals)
-            confidence: 100_000, // Moderate confidence for initial state
-            timestamp: current_time,
-        };
-
-        // **SECURITY FIX**: Validate oracle parameters to prevent manipulation
-        rift.oracle_prices = [initial_price_data; 10];
-        rift.price_index = 0;
-
-        // **SECURITY FIX**: Set reasonable bounds for oracle intervals to prevent DoS
-        rift.oracle_update_interval = 30 * 60; // 30 minutes (min 5 min, max 24 hours)
-        require!(
-            rift.oracle_update_interval >= 300 && rift.oracle_update_interval <= 86400,
-            ErrorCode::InvalidOracleParameters
-        );
-
-        rift.max_rebalance_interval = 24 * 60 * 60; // 24 hours (min 1 hour, max 7 days)
-        require!(
-            rift.max_rebalance_interval >= 3600 && rift.max_rebalance_interval <= 604800,
-            ErrorCode::InvalidOracleParameters
-        );
-
-        rift.arbitrage_threshold_bps = 200; // 2% (min 0.1%, max 50%)
-        require!(
-            rift.arbitrage_threshold_bps >= 10 && rift.arbitrage_threshold_bps <= 5000,
-            ErrorCode::InvalidOracleParameters
-        );
-
-        rift.last_oracle_update = current_time;
-        
-        // Initialize advanced metrics
-        rift.total_volume_24h = 0;
-        rift.price_deviation = 0;
-        rift.arbitrage_opportunity_bps = 0;
-        // **SECURITY FIX**: Initialize Jupiter program ID as None (uses hardcoded fallback)
-        rift.jupiter_program_id = None;
-        rift.rebalance_count = 0;
-        
-        // Initialize RIFTS token distribution tracking
-        rift.total_fees_collected = 0;
-        rift.rifts_tokens_distributed = 0;
-        rift.rifts_tokens_burned = 0;
-        
-        // Initialize Meteora-style DLMM Pool (NEW)
-        rift.liquidity_pool = None;  // Will be set during first wrap
-        rift.lp_token_supply = 0;
-        rift.pool_trading_fee_bps = 30;  // Default 0.3% trading fee
-        rift.total_liquidity_underlying = 0;
-        rift.total_liquidity_rift = 0;
-        rift.active_bin_id = 0;      // Will be set during pool creation
-        rift.bin_step = 0;           // Will be set during pool creation
-        
-        // Initialize LP staking
-        rift.total_lp_staked = 0;
-        rift.pending_rewards = 0;
-        rift.last_reward_distribution = Clock::get()?.unix_timestamp;
-        
-        // Initialize reentrancy protection
-        rift.reentrancy_guard = false;
-        
-        // Initialize emergency controls
-        rift.is_paused = false;
-        rift.pause_timestamp = 0;
-        
-        // Initialize external program integration
-        rift.pending_fee_distribution = 0;
-        
-        // Initialize governance integration
-        rift.last_governance_update = Clock::get()?.unix_timestamp;
-        
-        emit!(RiftCreated {
-            rift: rift.key(),
-            creator: rift.creator,
-            underlying_mint: rift.underlying_mint,
-            burn_fee_bps,
-            partner_fee_bps,
-        });
-
-        Ok(())
-    }
 
     /// Create a new Rift with PDA-based vanity mint address (like pump.fun approach)
     /// This generates the mint PDA deterministically from vanity seed
@@ -559,35 +409,13 @@ pub mod rifts_protocol {
             initialize_accounts,
         );
 
+        // Pool creation must be done via JavaScript/TypeScript using Meteora SDK
+        // Reason: cp_amm crate doesn't export InitializeCustomizablePoolParameters
         msg!("❌ Pool creation must be done via JavaScript/TypeScript");
         msg!("✅ Use create-meteora-pool-with-price-range.js to initialize pools");
-        msg!("   This ensures sqrt_min_price={} and sqrt_max_price={}", MIN_SQRT_PRICE, MAX_SQRT_PRICE);
-        msg!("   Reason: cp_amm crate doesn't export InitializeCustomizablePoolParameters");
         msg!("   After pool is created externally, wrap/unwrap will work via this program's CPI");
 
-        return err!(ErrorCode::UseJavaScriptForPoolCreation);
-
-        msg!("Successfully created official Meteora DAMM v2 pool at: {}", expected_pool_pubkey);
-
-        // Update rift state to reference the official Meteora pool
-        rift.liquidity_pool = Some(expected_pool_pubkey);
-        // **SECURITY FIX**: Track underlying tokens wrapped separately
-        rift.total_underlying_wrapped = rift.total_underlying_wrapped
-            .checked_add(amount_after_fee)
-            .ok_or(ErrorCode::MathOverflow)?;
-        rift.total_fees_collected = rift.total_fees_collected
-            .checked_add(wrap_fee)
-            .ok_or(ErrorCode::MathOverflow)?;
-
-        emit!(MeteoraPoolCreated {
-            rift: rift.key(),
-            meteora_pool: meteora_pool_key,
-            underlying_amount: amount_after_fee,
-            rift_amount: mint_amount,
-            bin_step,
-        });
-
-        Ok(())
+        return err!(ErrorCode::UseJavaScriptForPoolCreation)
     }
 
 
@@ -1147,234 +975,6 @@ pub mod rifts_protocol {
         Ok(())
     }
 
-    /// Unwrap rift tokens with Meteora liquidity removal (if pool exists)
-    /// This is the COMPLETE version that handles Meteora DAMM v2 integration
-    /// TEMPORARILY DISABLED: Compilation issue with RemoveLiquidityParameters struct
-    /* pub fn unwrap_with_meteora_removal(
-        ctx: Context<UnwrapWithMeteoraRemoval>,
-        rift_token_amount: u64,
-    ) -> Result<()> {
-        let rift = &mut ctx.accounts.rift;
-
-        // Reentrancy protection
-        require!(!rift.reentrancy_guard, ErrorCode::ReentrancyDetected);
-        rift.reentrancy_guard = true;
-
-        // Check if rift is paused
-        require!(!rift.is_paused, ErrorCode::RiftPaused);
-
-        // Validate amount
-        require!(rift_token_amount > 0, ErrorCode::InvalidAmount);
-
-        // Calculate underlying tokens needed
-        require!(rift.backing_ratio > 0, ErrorCode::InvalidBackingRatio);
-        let underlying_amount = rift_token_amount
-            .checked_mul(rift.backing_ratio)
-            .ok_or(ErrorCode::MathOverflow)?
-            .checked_div(10000)
-            .ok_or(ErrorCode::MathOverflow)?;
-
-        // Calculate unwrap fee (0.7%)
-        let unwrap_fee = underlying_amount
-            .checked_mul(70)
-            .ok_or(ErrorCode::MathOverflow)?
-            .checked_div(10000)
-            .ok_or(ErrorCode::MathOverflow)?;
-        let amount_after_fee = underlying_amount
-            .checked_sub(unwrap_fee)
-            .ok_or(ErrorCode::MathOverflow)?;
-
-        // Burn rift tokens
-        require!(
-            ctx.accounts.token_program.key() == anchor_spl::token::ID,
-            ErrorCode::InvalidProgramId
-        );
-
-        let burn_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            anchor_spl::token::Burn {
-                mint: ctx.accounts.rift_mint.to_account_info(),
-                from: ctx.accounts.user_rift_tokens.to_account_info(),
-                authority: ctx.accounts.user.to_account_info(),
-            },
-        );
-        anchor_spl::token::burn(burn_ctx, rift_token_amount)?;
-
-        // Check vault balance
-        let vault_balance = ctx.accounts.vault.amount;
-
-        if vault_balance >= amount_after_fee {
-            // Sufficient funds in vault - direct transfer
-            let rift_key = rift.key();
-            let vault_auth_seeds = &[
-                b"vault_auth",
-                rift_key.as_ref(),
-                &[ctx.bumps.vault_authority],
-            ];
-            let signer_seeds = &[&vault_auth_seeds[..]];
-
-            let transfer_ctx = CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from: ctx.accounts.vault.to_account_info(),
-                    to: ctx.accounts.user_underlying.to_account_info(),
-                    authority: ctx.accounts.vault_authority.to_account_info(),
-                },
-                signer_seeds,
-            );
-            token::transfer(transfer_ctx, amount_after_fee)?;
-        } else if rift.liquidity_pool.is_some() {
-            // Need to remove liquidity from Meteora pool
-            let needed_from_pool = amount_after_fee
-                .checked_sub(vault_balance)
-                .ok_or(ErrorCode::MathOverflow)?;
-
-            // Transfer available vault balance first
-            if vault_balance > 0 {
-                let rift_key = rift.key();
-                let vault_auth_seeds = &[
-                    b"vault_auth",
-                    rift_key.as_ref(),
-                    &[ctx.bumps.vault_authority],
-                ];
-                let signer_seeds = &[&vault_auth_seeds[..]];
-
-                let transfer_ctx = CpiContext::new_with_signer(
-                    ctx.accounts.token_program.to_account_info(),
-                    Transfer {
-                        from: ctx.accounts.vault.to_account_info(),
-                        to: ctx.accounts.user_underlying.to_account_info(),
-                        authority: ctx.accounts.vault_authority.to_account_info(),
-                    },
-                    signer_seeds,
-                );
-                token::transfer(transfer_ctx, vault_balance)?;
-            }
-
-            // Calculate liquidity to remove from Meteora
-            // We need to get the position's liquidity and calculate the proportional amount
-            // For now, we'll use a simple calculation: remove enough to get needed_from_pool
-            // Add 1% buffer for fees/slippage
-            let needed_with_buffer = needed_from_pool
-                .checked_mul(101)
-                .ok_or(ErrorCode::MathOverflow)?
-                .checked_div(100)
-                .ok_or(ErrorCode::MathOverflow)?;
-
-            // Convert to u128 for Meteora (which uses u128 for liquidity)
-            let liquidity_to_remove = u128::from(needed_with_buffer);
-
-            // Set minimum thresholds (allow up to 2% slippage)
-            let min_underlying = needed_from_pool
-                .checked_mul(98)
-                .ok_or(ErrorCode::MathOverflow)?
-                .checked_div(100)
-                .ok_or(ErrorCode::MathOverflow)?;
-
-            // Call Meteora's remove_liquidity via CPI
-            // Determine token order (Meteora requires lexicographic ordering)
-            let underlying_mint_key = ctx.accounts.underlying_mint.key();
-            let rift_mint_key = ctx.accounts.rift_mint.key();
-            let is_underlying_token_a = underlying_mint_key < rift_mint_key;
-
-            let (min_amount_a, min_amount_b) = if is_underlying_token_a {
-                (min_underlying, 0u64) // We only care about getting underlying tokens back
-            } else {
-                (0u64, min_underlying)
-            };
-
-            let rift_key = rift.key();
-            let vault_auth_seeds = &[
-                b"vault_authority",
-                rift_key.as_ref(),
-                &[ctx.bumps.vault_authority_for_meteora],
-            ];
-            let signer_seeds = &[&vault_auth_seeds[..]];
-
-            let remove_liq_ctx = CpiContext::new_with_signer(
-                ctx.accounts.meteora_program.to_account_info(),
-                RemoveLiquidityCtx {
-                    pool_authority: ctx.accounts.pool_authority.to_account_info(),
-                    pool: ctx.accounts.pool.to_account_info(),
-                    position: ctx.accounts.position.to_account_info(),
-                    token_a_account: ctx.accounts.token_a_user.to_account_info(),
-                    token_b_account: ctx.accounts.token_b_user.to_account_info(),
-                    token_a_vault: ctx.accounts.token_a_vault.to_account_info(),
-                    token_b_vault: ctx.accounts.token_b_vault.to_account_info(),
-                    token_a_mint: ctx.accounts.token_a_mint.to_account_info(),
-                    token_b_mint: ctx.accounts.token_b_mint.to_account_info(),
-                    position_nft_account: ctx.accounts.position_nft_account.to_account_info(),
-                    owner: ctx.accounts.vault_authority_for_meteora.to_account_info(),
-                    token_a_program: ctx.accounts.token_a_program.to_account_info(),
-                    token_b_program: ctx.accounts.token_b_program.to_account_info(),
-                    event_authority: ctx.accounts.event_authority.to_account_info(),
-                    program: ctx.accounts.meteora_program.to_account_info(),
-                },
-                signer_seeds,
-            );
-
-            // Build Meteora's RemoveLiquidityParameters inline
-            // Must match exact struct name from Meteora
-            #[derive(anchor_lang::AnchorSerialize, anchor_lang::AnchorDeserialize)]
-            struct RemoveLiquidityParameters {
-                liquidity_delta: Option<u128>,
-                token_a_amount_threshold: u64,
-                token_b_amount_threshold: u64,
-            }
-            let params = RemoveLiquidityParameters {
-                liquidity_delta: Some(liquidity_to_remove),
-                token_a_amount_threshold: min_amount_a,
-                token_b_amount_threshold: min_amount_b,
-            };
-
-            // Call remove_liquidity CPI
-            cp_amm::cpi::remove_liquidity(
-                remove_liq_ctx,
-                params,
-            )?;
-
-            msg!("Successfully removed {} liquidity from Meteora pool", liquidity_to_remove);
-        } else {
-            // No Meteora pool and insufficient vault balance
-            return Err(ErrorCode::InsufficientFunds.into());
-        }
-
-        // Update rift accounting
-        rift.total_underlying_wrapped = rift.total_underlying_wrapped.saturating_sub(underlying_amount);
-        rift.total_rift_minted = rift.total_rift_minted.saturating_sub(rift_token_amount);
-        rift.total_fees_collected = rift.total_fees_collected
-            .checked_add(unwrap_fee)
-            .ok_or(ErrorCode::MathOverflow)?;
-        rift.total_burned = rift.total_burned
-            .checked_add(rift_token_amount)
-            .ok_or(ErrorCode::MathOverflow)?;
-        rift.total_volume_24h = rift.total_volume_24h
-            .checked_add(underlying_amount)
-            .ok_or(ErrorCode::MathOverflow)?;
-        rift.last_oracle_update = Clock::get()?.unix_timestamp;
-
-        // Process fee distribution
-        rift.process_fee_immediately(unwrap_fee)?;
-
-        // Check for rebalance
-        let clock = Clock::get()?;
-        if rift.should_trigger_rebalance(clock.unix_timestamp)? {
-            rift.trigger_automatic_rebalance(clock.unix_timestamp)?;
-        }
-
-        // Release reentrancy guard
-        rift.reentrancy_guard = false;
-
-        emit!(UnwrapExecuted {
-            rift: rift.key(),
-            user: ctx.accounts.user.key(),
-            rift_token_amount,
-            fee_amount: unwrap_fee,
-            underlying_returned: amount_after_fee,
-        });
-
-        Ok(())
-    } */
 
     /// Update oracle price (restricted to authorized oracle)
     // **SECURITY FIX**: This function was replaced with secure external oracle implementation
@@ -1538,49 +1138,7 @@ pub mod rifts_protocol {
         Ok(())
     }
 
-    // /// Stake LP tokens for RIFTS rewards via external LP staking program
-    // /// TEMPORARILY DISABLED: Cross-crate type conflicts
-    // pub fn stake_lp_tokens_external(
-    //     ctx: Context<StakeLPTokensExternal>,
-    //     amount: u64,
-    // ) -> Result<()> {
-    //     let rift = &mut ctx.accounts.rift;
-    //
-    //     // Validate amount
-    //     require!(amount > 0, ErrorCode::InvalidAmount);
-    //     require!(amount <= 1_000_000_000_000, ErrorCode::AmountTooLarge);
-    //
-    //     // CPI to external LP staking program
-    //     let cpi_program = ctx.accounts.lp_staking_program.to_account_info();
-    //     let cpi_accounts = lp_staking::cpi::accounts::StakeTokens {
-    //         user: ctx.accounts.user.to_account_info(),
-    //         staking_pool: ctx.accounts.staking_pool.to_account_info(),
-    //         user_stake_account: ctx.accounts.user_stake_account.to_account_info(),
-    //         user_lp_tokens: ctx.accounts.user_lp_tokens.to_account_info(),
-    //         pool_lp_tokens: ctx.accounts.pool_lp_tokens.to_account_info(),
-    //         system_program: ctx.accounts.system_program.to_account_info(),
-    //         token_program: ctx.accounts.token_program.to_account_info(),
-    //     };
-    //
-    //     let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-    //     lp_staking::cpi::stake(cpi_ctx, amount)?;
-    //
-    //     // Update rift totals
-    //     rift.total_lp_staked = rift.total_lp_staked
-    //         .checked_add(amount)
-    //         .ok_or(ErrorCode::MathOverflow)?;
-    //
-    //     emit!(LPTokensStaked {
-    //         rift: rift.key(),
-    //         user: ctx.accounts.user.key(),
-    //         amount,
-    //         total_staked: rift.total_lp_staked,
-    //     });
-    //
-    //     Ok(())
-    // }
-
-    /// Stake LP tokens for RIFTS rewards - INTERNAL IMPLEMENTATION (backwards compatibility)
+    /// Stake LP tokens for RIFTS rewards
     pub fn stake_lp_tokens(
         ctx: Context<StakeLPTokens>,
         amount: u64,
@@ -2159,47 +1717,7 @@ pub mod rifts_protocol {
 // SIMPLIFIED ACCOUNT STRUCTS TO REDUCE STACK USAGE
 
 #[derive(Accounts)]
-#[instruction(burn_fee_bps: u16, partner_fee_bps: u16, partner_wallet: Option<Pubkey>, rift_name: Option<String>)]
-pub struct CreateRiftWithVanityMint<'info> {
-    #[account(mut)]
-    pub creator: Signer<'info>,
-    
-    #[account(
-        init,
-        payer = creator,
-        space = 8 + std::mem::size_of::<Rift>() + 36, // Extra 36 bytes for String
-        seeds = [b"rift", underlying_mint.key().as_ref(), creator.key().as_ref()],
-        bump,
-    )]
-    pub rift: Account<'info, Rift>,
-    
-    pub underlying_mint: Account<'info, Mint>,
-    
-    /// The vanity mint account (pre-generated with address ending in 'rift')
-    /// This is passed in by the user, similar to how pump.fun accepts pre-generated mints
-    #[account(
-        init,
-        payer = creator,
-        mint::decimals = underlying_mint.decimals,
-        mint::authority = rift_mint_authority,
-        signer // The mint must be a signer to prove ownership
-    )]
-    pub rift_mint: Account<'info, Mint>,
-    
-    /// CHECK: PDA for mint authority
-    #[account(
-        seeds = [b"rift_mint_auth", rift.key().as_ref()],
-        bump
-    )]
-    pub rift_mint_authority: UncheckedAccount<'info>,
-    
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
-}
-
-#[derive(Accounts)]
-#[instruction(vanity_seed: Vec<u8>, mint_bump: u8, burn_fee_bps: u16, partner_fee_bps: u16, partner_wallet: Option<Pubkey>, rift_name: Option<String>)]
+#[instruction(vanity_seed: [u8; 32], seed_len: u8, mint_bump: u8, burn_fee_bps: u16, partner_fee_bps: u16, partner_wallet: Option<Pubkey>, rift_name: [u8; 32], name_len: u8)]
 pub struct CreateRiftWithVanityPDA<'info> {
     #[account(mut)]
     pub creator: Signer<'info>,
@@ -2207,8 +1725,8 @@ pub struct CreateRiftWithVanityPDA<'info> {
     #[account(
         init,
         payer = creator,
-        space = 8 + std::mem::size_of::<Rift>() + 36, // Extra 36 bytes for String
-        seeds = [b"rift", underlying_mint.key().as_ref(), creator.key().as_ref(), vanity_seed.as_ref()],
+        space = 8 + std::mem::size_of::<Rift>(),
+        seeds = [b"rift", underlying_mint.key().as_ref(), creator.key().as_ref(), &vanity_seed[..seed_len as usize]],
         bump,
     )]
     pub rift: Account<'info, Rift>,
@@ -2220,8 +1738,8 @@ pub struct CreateRiftWithVanityPDA<'info> {
         init,
         payer = creator,
         mint::decimals = underlying_mint.decimals,
-        mint::authority = rift_mint_authority,  // Use rift_mint_authority PDA for proper signing
-        seeds = [b"rift_mint", creator.key().as_ref(), underlying_mint.key().as_ref(), vanity_seed.as_ref()],
+        mint::authority = rift_mint_authority,
+        seeds = [b"rift_mint", creator.key().as_ref(), underlying_mint.key().as_ref(), &vanity_seed[..seed_len as usize]],
         bump,
     )]
     pub rift_mint: Account<'info, Mint>,
@@ -2286,85 +1804,6 @@ pub struct CreateRift<'info> {
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
-}
-
-/// DEPRECATED - replaced by WrapAndAddLiquidity
-#[derive(Accounts)]
-pub struct DeprecatedBasicWrapTokens<'info> {
-    #[account(mut)]
-    pub user: Signer<'info>,
-
-    #[account(mut)]
-    pub rift: Account<'info, Rift>,
-
-    /// User's underlying token account (SOL/WSOL)
-    #[account(mut)]
-    pub user_underlying: Account<'info, TokenAccount>,
-
-    /// User's RIFT token account
-    #[account(mut)]
-    pub user_rift_tokens: Account<'info, TokenAccount>,
-
-    /// **METEORA INTEGRATION**: Meteora pool account
-    #[account(mut)]
-    /// CHECK: Validated against rift.liquidity_pool
-    pub pool: UncheckedAccount<'info>,
-
-    /// **METEORA INTEGRATION**: Liquidity position account
-    #[account(mut)]
-    /// CHECK: Meteora position NFT holder
-    pub position: UncheckedAccount<'info>,
-
-    /// **METEORA INTEGRATION**: Position NFT account proving ownership
-    #[account(mut)]
-    /// CHECK: Meteora validates this
-    pub position_nft_account: UncheckedAccount<'info>,
-
-    /// **METEORA INTEGRATION**: Pool authority PDA
-    /// CHECK: Meteora-derived PDA
-    pub pool_authority: UncheckedAccount<'info>,
-
-    /// **METEORA INTEGRATION**: Pool's token A vault (underlying)
-    #[account(mut)]
-    /// CHECK: Meteora pool vault
-    pub token_a_vault: UncheckedAccount<'info>,
-
-    /// **METEORA INTEGRATION**: Pool's token B vault (RIFT)
-    #[account(mut)]
-    /// CHECK: Meteora pool vault
-    pub token_b_vault: UncheckedAccount<'info>,
-
-    /// RIFT mint
-    #[account(
-        mut,
-        constraint = rift_mint.mint_authority == COption::Some(rift_mint_authority.key()) @ ErrorCode::InvalidMintAuthority
-    )]
-    pub rift_mint: Account<'info, Mint>,
-
-    /// Underlying mint (SOL/WSOL)
-    pub underlying_mint: Account<'info, Mint>,
-
-    /// RIFT mint authority PDA
-    /// CHECK: PDA
-    #[account(
-        seeds = [b"rift_mint_auth", rift.key().as_ref()],
-        bump
-    )]
-    pub rift_mint_authority: UncheckedAccount<'info>,
-
-    /// **METEORA INTEGRATION**: Meteora program
-    /// CHECK: Validated against METEORA_DAMM_V2_PROGRAM_ID
-    #[account(
-        constraint = meteora_program.key() == METEORA_DAMM_V2_PROGRAM_ID @ ErrorCode::InvalidProgramId,
-        constraint = meteora_program.executable @ ErrorCode::InvalidProgramId
-    )]
-    pub meteora_program: UncheckedAccount<'info>,
-
-    /// **METEORA INTEGRATION**: Event authority for Meteora events
-    /// CHECK: PDA derived with ["__event_authority"] seeds from Meteora program
-    pub event_authority: UncheckedAccount<'info>,
-
-    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
@@ -2889,40 +2328,6 @@ pub struct ProcessFeeDistribution<'info> {
 }
 
 #[derive(Accounts)]
-pub struct StakeLPTokensExternal<'info> {
-    #[account(mut)]
-    pub user: Signer<'info>,
-    
-    #[account(mut)]
-    pub rift: Account<'info, Rift>,
-    
-    /// External LP staking pool
-    #[account(mut)]
-    pub staking_pool: Account<'info, lp_staking::StakingPool>,
-    
-    /// User's stake account in external program
-    #[account(mut)]
-    pub user_stake_account: Account<'info, lp_staking::UserStakeAccount>,
-    
-    #[account(mut)]
-    pub user_lp_tokens: Account<'info, TokenAccount>,
-    
-    #[account(mut)]
-    pub pool_lp_tokens: Account<'info, TokenAccount>,
-    
-    /// External LP staking program for CPI
-    /// CHECK: LP staking program validation
-    #[account(
-        constraint = lp_staking_program.key() == lp_staking::ID @ ErrorCode::InvalidProgramId,
-        constraint = lp_staking_program.executable @ ErrorCode::InvalidProgramId
-    )]
-    pub lp_staking_program: UncheckedAccount<'info>,
-    
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
 pub struct StakeLPTokens<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
@@ -3229,16 +2634,6 @@ impl Rift {
     }
 }
 
-/// Oracle Registry for governance-controlled oracle management
-#[account]
-pub struct OracleRegistry {
-    pub authorized_oracles: Vec<Pubkey>,  // List of authorized oracle addresses
-    pub update_authority: Pubkey,         // Governance authority to update oracles
-    pub last_updated: i64,                // Last time registry was updated
-    pub min_confirmations: u8,            // Minimum oracle confirmations required
-    pub max_staleness: i64,               // Maximum staleness allowed (seconds)
-}
-
 /// LP Staking account for individual stakers
 #[account]
 pub struct StakerAccount {
@@ -3259,10 +2654,6 @@ pub struct PriceData {
     pub confidence: u64,
     pub timestamp: i64,
 }
-
-
-
-// LP Staking will be implemented in a separate program for modularity
 
 impl Rift {
     pub fn add_price_data(&mut self, price: u64, confidence: u64, timestamp: i64) -> Result<()> {
@@ -3558,8 +2949,6 @@ impl Rift {
         Ok(())
     }
 }
-
-// LP Staking implementation will be added in future versions
 
 #[event]
 pub struct RiftCreated {
