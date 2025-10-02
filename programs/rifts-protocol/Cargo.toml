@@ -17,15 +17,24 @@ default = []
 idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 
 [dependencies]
-anchor-lang = { version = "0.29.0", features = ["init-if-needed"] }
-anchor-spl = { version = "0.29.0", features = ["default", "token"] }
+anchor-lang = { version = "0.31.0", features = ["init-if-needed"] }
+anchor-spl = { version = "0.31.0", features = ["default", "token"] }
+bytemuck = "1.20.0"
 
-# DEX integration dependencies
-# jupiter-core = { version = "0.1.0", optional = true }  # Jupiter V6 SDK
-# meteora-pools = { version = "0.1.0", optional = true } # Meteora DLMM SDK
-# Note: Using direct CPI calls instead of SDKs to avoid version conflicts
+# **METEORA DAMM V2 INTEGRATION**: Using latest version with full functionality
+cp-amm = { git = "https://github.com/MeteoraAg/damm-v2", features = ["cpi"] }
+rust-sdk = { git = "https://github.com/MeteoraAg/damm-v2" }
+# Note: Using patched Solana dependencies from workspace to fix curve25519-dalek BPF stack issues
+
+# **JUPITER V6 INTEGRATION**: Real program ID and instruction handling  
+spl-associated-token-account = { version = "6.0.0", features = ["no-entrypoint"] } # Updated for compatibility
+# Note: Using Jupiter program ID directly instead of SDK to avoid dependency conflicts
 
 # CPI dependencies for cross-program integration
 fee-collector = { path = "../fee-collector", features = ["cpi"] }
 governance = { path = "../governance", features = ["cpi"] }
 lp-staking = { path = "../lp-staking", features = ["cpi"] }
+
+# **FIX**: Suppress cosmetic Anchor cfg warnings
+[lints.rust]
+unexpected_cfgs = "allow"
