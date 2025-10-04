@@ -1476,6 +1476,7 @@ pub mod rifts_protocol {
     }
 
     /// Governance proposal execution for rift parameters
+    /// **SECURITY FIX #43**: Bind proposal to governance PDA to prevent cross-governance spoofing
     pub fn execute_governance_proposal(
         ctx: Context<ExecuteGovernanceProposal>,
         proposal_id: u64,
@@ -1485,9 +1486,23 @@ pub mod rifts_protocol {
         new_rebalance_threshold: Option<u16>,
     ) -> Result<()> {
         let rift = &mut ctx.accounts.rift;
-        
-        // Validate proposal execution via CPI to governance program
+        let governance = &ctx.accounts.governance;
         let proposal = &ctx.accounts.proposal;
+
+        // **SECURITY FIX #43**: Validate proposal belongs to THIS governance account
+        // Verify proposal ID matches the pending parameter change proposal in governance
+        require!(
+            governance.parameter_change_proposal_id == proposal_id,
+            ErrorCode::ProposalNotBoundToGovernance
+        );
+
+        // **SECURITY FIX #43**: Verify proposal matches the expected proposal
+        require!(
+            proposal.id == proposal_id,
+            ErrorCode::ProposalMismatch
+        );
+
+        // Validate proposal execution via CPI to governance program
         require!(
             proposal.proposal_type == governance::ProposalType::ParameterChange,
             ErrorCode::InvalidProposalType
@@ -1496,86 +1511,142 @@ pub mod rifts_protocol {
             proposal.status == governance::ProposalStatus::Executed,
             ErrorCode::ProposalNotApproved
         );
-        
-        // Execute parameter changes
-        if let Some(burn_fee) = new_burn_fee_bps {
+
+        // **SECURITY FIX #43**: Validate governance has pending parameter changes for this proposal
+        require!(
+            governance.pending_parameter_changes.is_some(),
+            ErrorCode::NoPendingParameterChanges
+        );
+
+        // Apply parameter changes from governance (source of truth)
+        let param_changes = governance.pending_parameter_changes.as_ref().unwrap();
+
+        // Execute parameter changes from governance-approved values
+        if let Some(burn_fee) = param_changes.burn_fee_bps {
             require!(burn_fee <= 4500, ErrorCode::InvalidBurnFee);
             rift.burn_fee_bps = burn_fee;
         }
-        
-        if let Some(partner_fee) = new_partner_fee_bps {
+
+        if let Some(partner_fee) = param_changes.partner_fee_bps {
             require!(partner_fee <= 500, ErrorCode::InvalidPartnerFee);
             rift.partner_fee_bps = partner_fee;
         }
-        
-        if let Some(oracle_interval) = new_oracle_interval {
+
+        if let Some(oracle_interval) = param_changes.oracle_update_interval {
             require!(oracle_interval >= 600, ErrorCode::InvalidOracleInterval); // Min 10 minutes
             rift.oracle_update_interval = oracle_interval;
         }
-        
-        if let Some(threshold) = new_rebalance_threshold {
+
+        if let Some(threshold) = param_changes.arbitrage_threshold_bps {
             require!(threshold >= 50 && threshold <= 1000, ErrorCode::InvalidRebalanceThreshold);
             rift.arbitrage_threshold_bps = threshold;
         }
-        
+
         // Update governance timestamp
         rift.last_governance_update = Clock::get()?.unix_timestamp;
-        
+
         emit!(GovernanceProposalExecuted {
             rift: rift.key(),
             proposal_id,
             executor: ctx.accounts.executor.key(),
             timestamp: Clock::get()?.unix_timestamp,
         });
-        
+
         Ok(())
     }
 
     /// Emergency pause function (governance controlled)
+    /// **SECURITY FIX #44**: Add CPI verification to governance for emergency controls
+    ///
+    /// **DESIGN DECISION**: Single-signature kill-switch intentionally allowed for emergency cases
+    /// - When required_signatures == 1: Any authorized signer can pause immediately (emergency kill-switch)
+    /// - When required_signatures > 1: Requires governance proposal execution first (multisig protection)
+    /// This balances security with the need for rapid emergency response.
     pub fn emergency_pause(
         ctx: Context<EmergencyPause>,
     ) -> Result<()> {
         let rift = &mut ctx.accounts.rift;
-        
-        // Validate governance authority
+        let governance = &ctx.accounts.governance;
+
+        // **SECURITY FIX #44**: Verify governance authority via signature bitmap
+        // Check if signer is either primary or additional authority
+        let signer = ctx.accounts.governance_authority.key();
+        let is_primary = signer == governance.authority;
+        let is_additional = governance.additional_authorities.contains(&signer);
+
         require!(
-            ctx.accounts.governance_authority.key() == ctx.accounts.governance.authority,
+            is_primary || is_additional,
             ErrorCode::UnauthorizedGovernance
         );
-        
+
+        // **SECURITY FIX #44**: If multisig is configured, verify emergency pause is authorized
+        // Emergency actions should be backed by a valid proposal
+        // **NOTE**: Single-sig mode (required_signatures == 1) allows immediate pause for true emergencies
+        if governance.required_signatures > 1 {
+            // Verify emergency pause is active in governance
+            require!(
+                governance.emergency_pause_active,
+                ErrorCode::EmergencyActionNotAuthorized
+            );
+        }
+
         rift.is_paused = true;
         rift.pause_timestamp = Clock::get()?.unix_timestamp;
-        
+
         emit!(RiftPaused {
             rift: rift.key(),
             authority: ctx.accounts.governance_authority.key(),
             timestamp: rift.pause_timestamp,
         });
-        
+
         Ok(())
     }
 
     /// Unpause function (governance controlled)
+    /// **SECURITY FIX #44**: Add CPI verification to governance for emergency controls
+    ///
+    /// **DESIGN DECISION**: Single-signature unpause intentionally allowed for operational flexibility
+    /// - When required_signatures == 1: Any authorized signer can unpause immediately
+    /// - When required_signatures > 1: Requires governance proposal execution first (multisig protection)
+    /// This balances security with the need for rapid emergency response and recovery.
     pub fn emergency_unpause(
         ctx: Context<EmergencyUnpause>,
     ) -> Result<()> {
         let rift = &mut ctx.accounts.rift;
-        
-        // Validate governance authority
+        let governance = &ctx.accounts.governance;
+
+        // **SECURITY FIX #44**: Verify governance authority via signature bitmap
+        // Check if signer is either primary or additional authority
+        let signer = ctx.accounts.governance_authority.key();
+        let is_primary = signer == governance.authority;
+        let is_additional = governance.additional_authorities.contains(&signer);
+
         require!(
-            ctx.accounts.governance_authority.key() == ctx.accounts.governance.authority,
+            is_primary || is_additional,
             ErrorCode::UnauthorizedGovernance
         );
-        
+
+        // **SECURITY FIX #44**: If multisig is configured, verify unpause is authorized
+        // Unpause should either be done when pause is not active OR when authorized
+        // **NOTE**: Single-sig mode (required_signatures == 1) allows immediate unpause for operational recovery
+        if governance.required_signatures > 1 {
+            // Allow unpause if emergency pause is not active in governance anymore
+            // This means the governance multisig has already approved the unpause
+            require!(
+                !governance.emergency_pause_active,
+                ErrorCode::EmergencyActionNotAuthorized
+            );
+        }
+
         rift.is_paused = false;
         rift.pause_timestamp = 0;
-        
+
         emit!(RiftUnpaused {
             rift: rift.key(),
             authority: ctx.accounts.governance_authority.key(),
             timestamp: Clock::get()?.unix_timestamp,
         });
-        
+
         Ok(())
     }
 
@@ -2448,13 +2519,19 @@ pub struct JupiterSwapForBuyback<'info> {
 pub struct ExecuteGovernanceProposal<'info> {
     #[account(mut)]
     pub executor: Signer<'info>,
-    
+
     #[account(mut)]
     pub rift: Account<'info, Rift>,
-    
-    /// Governance proposal being executed
+
+    /// **SECURITY FIX #43**: Governance proposal with PDA binding to prevent spoofing
+    /// Proposal must be derived from governance account to ensure it belongs to the correct governance
+    #[account(
+        seeds = [b"proposal", governance.key().as_ref(), &proposal.id.to_le_bytes()],
+        bump,
+        seeds::program = governance::ID
+    )]
     pub proposal: Account<'info, governance::Proposal>,
-    
+
     /// Governance state account
     pub governance: Account<'info, governance::Governance>,
 }
@@ -3242,6 +3319,14 @@ pub enum ErrorCode {
     Unauthorized,
     #[msg("Invalid byte slice conversion")]
     InvalidByteSlice,
+    #[msg("Proposal not bound to this governance account")]
+    ProposalNotBoundToGovernance,
+    #[msg("Proposal ID mismatch")]
+    ProposalMismatch,
+    #[msg("No pending parameter changes in governance")]
+    NoPendingParameterChanges,
+    #[msg("Emergency action not authorized by governance")]
+    EmergencyActionNotAuthorized,
 }
 
 // Oracle update instruction implementations

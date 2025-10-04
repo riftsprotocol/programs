@@ -255,6 +255,41 @@ pub mod fee_collector {
         Ok(())
     }
 
+    /// **SECURITY FIX #47**: Initialize protocol registry namescoped to governance
+    /// This prevents cross-governance deployment coupling by binding registry to specific governance
+    pub fn initialize_protocol_registry(
+        ctx: Context<InitializeProtocolRegistry>,
+        jupiter_program_id: Pubkey,
+        meteora_program_id: Pubkey,
+        orca_program_id: Pubkey,
+    ) -> Result<()> {
+        let registry = &mut ctx.accounts.protocol_registry;
+        let governance = &ctx.accounts.governance;
+
+        // Validate program IDs are not zero addresses
+        require!(jupiter_program_id != Pubkey::default(), FeeCollectorError::InvalidProgramId);
+        require!(meteora_program_id != Pubkey::default(), FeeCollectorError::InvalidProgramId);
+        require!(orca_program_id != Pubkey::default(), FeeCollectorError::InvalidProgramId);
+
+        // **SECURITY FIX #47**: Bind registry to governance authority
+        registry.governance = governance.key();
+        registry.authority = governance.authority;
+        registry.jupiter_program_id = jupiter_program_id;
+        registry.meteora_program_id = meteora_program_id;
+        registry.orca_program_id = orca_program_id;
+        registry.is_paused = false;
+
+        emit!(ProtocolRegistryInitialized {
+            governance: governance.key(),
+            authority: registry.authority,
+            jupiter_program_id,
+            meteora_program_id,
+            orca_program_id,
+        });
+
+        Ok(())
+    }
+
 }
 
 // Account structures
@@ -323,21 +358,22 @@ pub struct ProcessFeesWithJupiterSwap<'info> {
     )]
     pub collector_authority: UncheckedAccount<'info>,
     
-    /// Protocol registry for AMM validation
-    /// **CRITICAL FIX**: Added PDA validation to prevent malicious registry injection
-    #[account(
-        seeds = [b"protocol_registry"],
-        bump,
-        constraint = protocol_registry.authority == collector_authority.key() @ FeeCollectorError::Unauthorized
-    )]
-    pub protocol_registry: Account<'info, ProtocolRegistry>,
-    
     /// Governance account for Jupiter program ID
     /// **CRITICAL FIX**: Added program ID validation to prevent fake governance accounts
     #[account(
         constraint = governance.to_account_info().owner == &governance::ID @ FeeCollectorError::Unauthorized
     )]
     pub governance: Account<'info, governance::Governance>,
+
+    /// Protocol registry for AMM validation
+    /// **SECURITY FIX #47**: Namescoped to governance to prevent cross-deployment coupling
+    #[account(
+        seeds = [b"protocol_registry", governance.key().as_ref()],
+        bump,
+        constraint = protocol_registry.governance == governance.key() @ FeeCollectorError::RegistryGovernanceMismatch,
+        constraint = protocol_registry.authority == governance.authority @ FeeCollectorError::Unauthorized
+    )]
+    pub protocol_registry: Account<'info, ProtocolRegistry>,
     
     pub token_program: Program<'info, Token>,
 }
@@ -410,17 +446,26 @@ impl FeeCollector {
         263; // reserved (295 - 32 for jupiter_program_id)
 }
 
+/// **SECURITY FIX #47**: ProtocolRegistry namescoped to governance
+/// This prevents cross-governance deployment coupling
 #[account]
 pub struct ProtocolRegistry {
+    pub governance: Pubkey,          // **FIX #47**: Bind to specific governance
     pub authority: Pubkey,
     pub jupiter_program_id: Pubkey,
-    pub meteora_program_id: Pubkey, 
+    pub meteora_program_id: Pubkey,
     pub orca_program_id: Pubkey,
     pub is_paused: bool,
 }
 
 impl ProtocolRegistry {
-    pub const INIT_SPACE: usize = 8 + 32 + 32 + 32 + 32 + 1;
+    pub const INIT_SPACE: usize = 8 + // discriminator
+        32 + // governance
+        32 + // authority
+        32 + // jupiter_program_id
+        32 + // meteora_program_id
+        32 + // orca_program_id
+        1;   // is_paused
 }
 
 // Events
@@ -450,11 +495,50 @@ pub struct UpdateJupiterProgramId<'info> {
     pub fee_collector: Account<'info, FeeCollector>,
 }
 
+/// **SECURITY FIX #47**: Initialize protocol registry with governance namescoping
+#[derive(Accounts)]
+pub struct InitializeProtocolRegistry<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// Governance account that owns this registry
+    /// **SECURITY FIX #47**: Registry is bound to specific governance to prevent cross-deployment coupling
+    #[account(
+        constraint = governance.to_account_info().owner == &governance::ID @ FeeCollectorError::InvalidProgramId,
+        constraint = governance.authority == authority.key() @ FeeCollectorError::Unauthorized
+    )]
+    pub governance: Account<'info, governance::Governance>,
+
+    /// **SECURITY FIX #47**: Protocol registry namescoped by governance key
+    #[account(
+        init,
+        payer = authority,
+        space = ProtocolRegistry::INIT_SPACE,
+        seeds = [b"protocol_registry", governance.key().as_ref()],
+        bump,
+        constraint = authority.lamports() >= rent.minimum_balance(ProtocolRegistry::INIT_SPACE) @ FeeCollectorError::InsufficientRentExemption
+    )]
+    pub protocol_registry: Account<'info, ProtocolRegistry>,
+
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
 #[event]
 pub struct FeesCollected {
     pub amount: u64,
     pub collector: Pubkey,
     pub source: Pubkey,
+}
+
+/// **SECURITY FIX #47**: Event for protocol registry initialization
+#[event]
+pub struct ProtocolRegistryInitialized {
+    pub governance: Pubkey,
+    pub authority: Pubkey,
+    pub jupiter_program_id: Pubkey,
+    pub meteora_program_id: Pubkey,
+    pub orca_program_id: Pubkey,
 }
 
 // Error codes
@@ -506,4 +590,6 @@ pub enum FeeCollectorError {
     InvalidTokenDecimals,
     #[msg("Unauthorized caller - only RIFTS protocol can collect fees")]
     UnauthorizedCaller,
+    #[msg("Protocol registry governance mismatch - registry not bound to this governance")]
+    RegistryGovernanceMismatch,
 }
