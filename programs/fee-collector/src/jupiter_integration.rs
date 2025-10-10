@@ -9,11 +9,14 @@ use anchor_lang::solana_program::{
 
 /// Execute Jupiter swap with pre-calculated instruction data from off-chain Jupiter API
 /// This is the CORRECT architecture - no manual ABI construction needed!
+/// **SECURITY FIX #52**: Added strict vault binding validation
 pub fn execute_jupiter_swap_with_instruction<'info>(
     jupiter_instruction_data: Vec<u8>,
     remaining_accounts: &[AccountInfo<'info>],
     signer_seeds: &[&[&[u8]]],
     jupiter_program_id: Pubkey, // **SECURITY FIX**: Use governance-configurable Jupiter program ID
+    expected_source_vault: Pubkey, // **FIX #52**: Expected source vault for strict binding
+    expected_destination_vault: Pubkey, // **FIX #52**: Expected destination vault for strict binding
 ) -> Result<()> {
     msg!("🚀 Fee Collector: Executing Jupiter swap with off-chain calculated instruction");
 
@@ -60,12 +63,12 @@ pub fn execute_jupiter_swap_with_instruction<'info>(
         FeeCollectorError::InvalidProgramId
     );
 
-    // **ENHANCED SECURITY FIX**: Comprehensive route validation with semantic analysis
+    // **SECURITY FIX #52**: Strict vault binding validation with explicit vault checks
     let mut has_token_program = false;
     let mut valid_account_count = 0;
     let mut token_account_count = 0;
-    let mut source_token_found = false;
-    let mut destination_token_found = false;
+    let mut source_vault_found = false;
+    let mut destination_vault_found = false;
     let mut fee_collector_authority_found = false;
 
     for account in &remaining_accounts[1..] {
@@ -91,40 +94,40 @@ pub fn execute_jupiter_swap_with_instruction<'info>(
             has_token_program = true;
         }
 
-        // **ENHANCED SECURITY**: Semantic route validation
+        // **SECURITY FIX #52**: Strict vault binding - validate against expected vaults
         if account.owner == &anchor_spl::token::ID {
             token_account_count += 1;
 
             // **CRITICAL SECURITY**: Validate token accounts are writable where expected
             require!(account.is_writable, FeeCollectorError::InvalidJupiterInstruction);
 
-            // **SEMANTIC VALIDATION**: Ensure at least one account matches our controlled vaults
-            // This prevents routing to arbitrary external accounts
-            let account_data = account.try_borrow_data()?;
-            if account_data.len() >= 32 {
-                // Parse token account mint (simplified - at offset 0 in token account)
-                let mint_bytes = &account_data[0..32];
+            // **STRICT BINDING FIX #52**: Match against expected source/destination vaults
+            if *account.key == expected_source_vault {
+                source_vault_found = true;
+                msg!("✅ Source vault validated: {}", expected_source_vault);
+            } else if *account.key == expected_destination_vault {
+                destination_vault_found = true;
+                msg!("✅ Destination vault validated: {}", expected_destination_vault);
+            }
 
-                // Check if this is our expected source or destination token account
-                // These would need to be passed in or derived from context
-                if account.is_signer {
-                    fee_collector_authority_found = true;
-                }
-
-                // Track if we found source/destination (simplified logic)
-                if !source_token_found {
-                    source_token_found = true;
-                } else if !destination_token_found {
-                    destination_token_found = true;
-                }
+            // Track if authority is signing
+            if account.is_signer {
+                fee_collector_authority_found = true;
             }
         }
 
         valid_account_count += 1;
     }
 
-    // **ENHANCED SECURITY**: Semantic validation requirements
-    require!(source_token_found && destination_token_found, FeeCollectorError::InvalidJupiterInstruction);
+    // **CRITICAL FIX #52**: Require EXACT vault matches (not just any token accounts)
+    require!(
+        source_vault_found,
+        FeeCollectorError::VaultNotFoundInRoute
+    );
+    require!(
+        destination_vault_found,
+        FeeCollectorError::VaultNotFoundInRoute
+    );
     require!(fee_collector_authority_found, FeeCollectorError::InvalidJupiterInstruction);
     
     // Jupiter swaps must include token program

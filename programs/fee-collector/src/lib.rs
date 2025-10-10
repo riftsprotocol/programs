@@ -132,12 +132,18 @@ pub mod fee_collector {
         
         // **SECURITY FIX**: Use governance-configured Jupiter program ID (no hardcoded fallback)
         let jupiter_program_id = collector.jupiter_program_id;
-        
+
+        // **SECURITY FIX #52**: Pass vault keys for strict binding validation
+        let source_vault_key = ctx.accounts.collector_vault.key();
+        let destination_vault_key = ctx.accounts.rifts_vault.key();
+
         execute_jupiter_swap_with_instruction(
             jupiter_instruction_data,
             &ctx.remaining_accounts,
             signer_seeds,
             jupiter_program_id,
+            source_vault_key,
+            destination_vault_key,
         )?;
         
         // Re-borrow collector for state updates
@@ -592,4 +598,6 @@ pub enum FeeCollectorError {
     UnauthorizedCaller,
     #[msg("Protocol registry governance mismatch - registry not bound to this governance")]
     RegistryGovernanceMismatch,
+    #[msg("Expected vault not found in Jupiter route - strict vault binding failed")]
+    VaultNotFoundInRoute,
 }

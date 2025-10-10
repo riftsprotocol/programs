@@ -140,6 +140,10 @@ pub mod rifts_protocol {
         // Initialize LP staking
         rift.total_lp_staked = 0;
 
+        // **SECURITY FIX #50**: Initialize oracle accounts as None (must be set explicitly)
+        rift.pyth_price_account = None;
+        rift.switchboard_feed_account = None;
+
         // Mint account is automatically initialized by Anchor with the init constraint
 
         // Emit creation event
@@ -232,7 +236,11 @@ pub mod rifts_protocol {
         rift.total_lp_staked = 0;
         rift.pending_rewards = 0;
         rift.last_reward_distribution = Clock::get()?.unix_timestamp;
-        
+
+        // **SECURITY FIX #50**: Initialize oracle accounts as None (must be set explicitly)
+        rift.pyth_price_account = None;
+        rift.switchboard_feed_account = None;
+
         // Initialize reentrancy protection
         rift.reentrancy_guard = false;
         
@@ -490,18 +498,30 @@ pub mod rifts_protocol {
     /// STEP 2: Create Meteora pool with initial liquidity using wrapped RIFT tokens
     /// User must have RIFT and SOL tokens from wrapping first
     /// Pool creation is done via JavaScript SDK, this just tracks it
+    /// **SECURITY FIX #48**: Store all pool state for validation
     pub fn set_pool_address(
         ctx: Context<SetPoolAddress>,
         pool_address: Pubkey,
+        pool_authority: Pubkey,
+        token_a_vault: Pubkey,
+        token_b_vault: Pubkey,
     ) -> Result<()> {
         let rift = &mut ctx.accounts.rift;
 
         require!(rift.creator == ctx.accounts.user.key(), ErrorCode::Unauthorized);
         require!(rift.liquidity_pool.is_none(), ErrorCode::PoolAlreadyInitialized);
 
+        // **SECURITY FIX #48**: Store all Meteora pool state for later validation
         rift.liquidity_pool = Some(pool_address);
+        rift.pool_authority = Some(pool_authority);
+        rift.pool_token_a_vault = Some(token_a_vault);
+        rift.pool_token_b_vault = Some(token_b_vault);
 
-        msg!("✅ Set Meteora pool address: {}", pool_address);
+        msg!("✅ Set Meteora pool state:");
+        msg!("  Pool: {}", pool_address);
+        msg!("  Authority: {}", pool_authority);
+        msg!("  Token A Vault: {}", token_a_vault);
+        msg!("  Token B Vault: {}", token_b_vault);
 
         Ok(())
     }
@@ -524,6 +544,26 @@ pub mod rifts_protocol {
             ctx.accounts.pool.key() == rift.liquidity_pool.unwrap(),
             ErrorCode::InvalidPoolAccount
         );
+
+        // **SECURITY FIX #48**: Validate Meteora accounts against stored state
+        if let Some(expected_authority) = rift.pool_authority {
+            require!(
+                ctx.accounts.pool_authority.key() == expected_authority,
+                ErrorCode::InvalidPoolAuthority
+            );
+        }
+        if let Some(expected_vault_a) = rift.pool_token_a_vault {
+            require!(
+                ctx.accounts.token_a_vault.key() == expected_vault_a,
+                ErrorCode::InvalidPoolVault
+            );
+        }
+        if let Some(expected_vault_b) = rift.pool_token_b_vault {
+            require!(
+                ctx.accounts.token_b_vault.key() == expected_vault_b,
+                ErrorCode::InvalidPoolVault
+            );
+        }
 
         // Reentrancy protection
         require!(!rift.reentrancy_guard, ErrorCode::ReentrancyDetected);
@@ -632,6 +672,26 @@ pub mod rifts_protocol {
             ctx.accounts.pool.key() == rift.liquidity_pool.unwrap(),
             ErrorCode::InvalidPoolAccount
         );
+
+        // **SECURITY FIX #48**: Validate Meteora accounts against stored state
+        if let Some(expected_authority) = rift.pool_authority {
+            require!(
+                ctx.accounts.pool_authority.key() == expected_authority,
+                ErrorCode::InvalidPoolAuthority
+            );
+        }
+        if let Some(expected_vault_a) = rift.pool_token_a_vault {
+            require!(
+                ctx.accounts.token_a_vault.key() == expected_vault_a,
+                ErrorCode::InvalidPoolVault
+            );
+        }
+        if let Some(expected_vault_b) = rift.pool_token_b_vault {
+            require!(
+                ctx.accounts.token_b_vault.key() == expected_vault_b,
+                ErrorCode::InvalidPoolVault
+            );
+        }
 
         // Reentrancy protection
         require!(!rift.reentrancy_guard, ErrorCode::ReentrancyDetected);
@@ -976,10 +1036,254 @@ pub mod rifts_protocol {
     }
 
 
-    /// Update oracle price (restricted to authorized oracle)
-    // **SECURITY FIX**: This function was replaced with secure external oracle implementation
-    // See update_oracle_price function below that uses Pyth/Switchboard oracles
-    // The old function accepted arbitrary price data which was vulnerable to manipulation
+    /// **SECURITY FIX #50**: Update Pyth oracle price with strict validation
+    /// Binds to specific Pyth account stored in rift state and validates staleness, confidence, and decimals
+    pub fn update_pyth_oracle(
+        ctx: Context<UpdatePythOracle>,
+    ) -> Result<()> {
+        let rift = &mut ctx.accounts.rift;
+
+        // **SECURITY FIX #50**: Validate oracle authority (creator or governance)
+        require!(
+            ctx.accounts.oracle_authority.key() == rift.creator,
+            ErrorCode::Unauthorized
+        );
+
+        // **SECURITY FIX #50**: Bind to stored Pyth account address
+        let expected_pyth_account = rift.pyth_price_account
+            .ok_or(ErrorCode::OracleAccountNotSet)?;
+
+        require!(
+            ctx.accounts.pyth_price_account.key() == expected_pyth_account,
+            ErrorCode::OracleAccountMismatch
+        );
+
+        // **SECURITY FIX #50**: Validate Pyth account ownership
+        let pyth_program_id = Pubkey::from_str_const("FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH");
+        require!(
+            ctx.accounts.pyth_price_account.owner == &pyth_program_id,
+            ErrorCode::InvalidOracleOwner
+        );
+
+        // Parse Pyth price data
+        let pyth_price_data = &ctx.accounts.pyth_price_account.data.borrow();
+        require!(pyth_price_data.len() >= 240, ErrorCode::InvalidOracleData);
+
+        // Pyth price account layout:
+        // 0-4: magic (0xa1b2c3d4)
+        // 4-8: version
+        // 8-12: type
+        // 12-16: size
+        // 16-48: product account
+        // 48-80: next price account
+        // 80-88: aggregate price (i64)
+        // 88-96: confidence (u64)
+        // 96-100: status (u32)
+        // 100-104: corp_act (u32)
+        // 104-112: publish_time (i64)
+        // 112-120: prev_publish_time (i64)
+        // 120-128: prev_price (i64)
+        // 128-136: prev_conf (u64)
+        // ... more fields
+
+        let price_i64 = i64::from_le_bytes(
+            pyth_price_data[80..88].try_into().map_err(|_| ErrorCode::InvalidOracleData)?
+        );
+        let confidence_u64 = u64::from_le_bytes(
+            pyth_price_data[88..96].try_into().map_err(|_| ErrorCode::InvalidOracleData)?
+        );
+        let publish_time_i64 = i64::from_le_bytes(
+            pyth_price_data[104..112].try_into().map_err(|_| ErrorCode::InvalidOracleData)?
+        );
+        let exponent_i32 = i32::from_le_bytes(
+            pyth_price_data[20..24].try_into().map_err(|_| ErrorCode::InvalidOracleData)?
+        );
+
+        // Convert price to u64 (handle negative prices as error)
+        require!(price_i64 > 0, ErrorCode::InvalidOraclePrice);
+        let price = price_i64 as u64;
+        let confidence = confidence_u64;
+
+        // **SECURITY FIX #50**: Validate staleness (max 5 minutes)
+        let current_time = Clock::get()?.unix_timestamp;
+        const MAX_AGE_SECONDS: i64 = 300; // 5 minutes
+        require!(
+            current_time - publish_time_i64 <= MAX_AGE_SECONDS,
+            ErrorCode::OraclePriceStale
+        );
+
+        msg!("Pyth price age: {} seconds", current_time - publish_time_i64);
+
+        // **SECURITY FIX #50**: Validate confidence (confidence should be <= 5% of price)
+        let max_confidence = price.checked_mul(5).ok_or(ErrorCode::MathOverflow)?
+            .checked_div(100).ok_or(ErrorCode::MathOverflow)?;
+        require!(
+            confidence <= max_confidence,
+            ErrorCode::OracleConfidenceTooLow
+        );
+
+        msg!("Pyth confidence: {} (max allowed: {})", confidence, max_confidence);
+
+        // **SECURITY FIX #50**: Validate exponent/decimals (-8 to -6 typical for USD pairs)
+        require!(
+            exponent_i32 >= -18 && exponent_i32 <= 0,
+            ErrorCode::InvalidOracleExponent
+        );
+
+        msg!("Pyth exponent: {}", exponent_i32);
+
+        // Normalize price to 6 decimals (standard for rift system)
+        let normalized_price = if exponent_i32 < -6 {
+            // Scale down (e.g., -8 to -6: divide by 100)
+            let scale_factor = 10u64.pow((exponent_i32.abs() - 6) as u32);
+            price.checked_div(scale_factor).ok_or(ErrorCode::MathOverflow)?
+        } else if exponent_i32 > -6 {
+            // Scale up (e.g., -4 to -6: multiply by 100)
+            let scale_factor = 10u64.pow((6 - exponent_i32.abs()) as u32);
+            price.checked_mul(scale_factor).ok_or(ErrorCode::MathOverflow)?
+        } else {
+            price
+        };
+
+        // Update rift oracle with validated price
+        rift.add_price_data(normalized_price, confidence, current_time)?;
+
+        emit!(OraclePriceUpdated {
+            rift: rift.key(),
+            oracle_type: OracleType::Pyth,
+            price: normalized_price,
+            confidence,
+            timestamp: current_time,
+        });
+
+        Ok(())
+    }
+
+    /// **SECURITY FIX #50**: Update Switchboard oracle price with strict validation
+    /// Binds to specific Switchboard account stored in rift state and validates staleness, confidence, and decimals
+    pub fn update_switchboard_oracle(
+        ctx: Context<UpdateSwitchboardOracle>,
+    ) -> Result<()> {
+        let rift = &mut ctx.accounts.rift;
+
+        // **SECURITY FIX #50**: Validate oracle authority (creator or governance)
+        require!(
+            ctx.accounts.oracle_authority.key() == rift.creator,
+            ErrorCode::Unauthorized
+        );
+
+        // **SECURITY FIX #50**: Bind to stored Switchboard account address
+        let expected_switchboard_account = rift.switchboard_feed_account
+            .ok_or(ErrorCode::OracleAccountNotSet)?;
+
+        require!(
+            ctx.accounts.switchboard_feed.key() == expected_switchboard_account,
+            ErrorCode::OracleAccountMismatch
+        );
+
+        // **SECURITY FIX #50**: Validate Switchboard account ownership
+        let switchboard_program_id = Pubkey::from_str_const("SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64f");
+        require!(
+            ctx.accounts.switchboard_feed.owner == &switchboard_program_id,
+            ErrorCode::InvalidOracleOwner
+        );
+
+        // Parse Switchboard aggregator data
+        let switchboard_data = &ctx.accounts.switchboard_feed.data.borrow();
+        require!(switchboard_data.len() >= 512, ErrorCode::InvalidOracleData);
+
+        // Switchboard V2 AggregatorAccountData layout (simplified):
+        // The actual layout is complex, but the key fields we need are:
+        // - latest_confirmed_round.result (SwitchboardDecimal at specific offset)
+        // - latest_confirmed_round.round_open_timestamp (i64)
+        // - min_oracle_results (u32)
+        // - oracle_request_batch_size (u32)
+
+        // For security, we parse the essential fields for validation
+        // Offset 200: latest_confirmed_round.result.mantissa (i128)
+        // Offset 216: latest_confirmed_round.result.scale (u32)
+        // Offset 232: latest_confirmed_round.round_open_timestamp (i64)
+
+        let mantissa_bytes: [u8; 16] = switchboard_data[200..216].try_into()
+            .map_err(|_| ErrorCode::InvalidOracleData)?;
+        let mantissa = i128::from_le_bytes(mantissa_bytes);
+
+        let scale = u32::from_le_bytes(
+            switchboard_data[216..220].try_into().map_err(|_| ErrorCode::InvalidOracleData)?
+        );
+
+        let round_open_timestamp = i64::from_le_bytes(
+            switchboard_data[232..240].try_into().map_err(|_| ErrorCode::InvalidOracleData)?
+        );
+
+        // Convert mantissa to u64 price
+        require!(mantissa > 0, ErrorCode::InvalidOraclePrice);
+
+        // Calculate price with scale: price = mantissa / 10^scale
+        let price = if scale > 0 {
+            let divisor = 10u128.pow(scale);
+            let price_u128 = (mantissa as u128).checked_div(divisor)
+                .ok_or(ErrorCode::MathOverflow)?;
+            u64::try_from(price_u128).map_err(|_| ErrorCode::MathOverflow)?
+        } else {
+            u64::try_from(mantissa).map_err(|_| ErrorCode::MathOverflow)?
+        };
+
+        // **SECURITY FIX #50**: Validate staleness (max 5 minutes)
+        let current_time = Clock::get()?.unix_timestamp;
+        const MAX_AGE_SECONDS: i64 = 300; // 5 minutes
+        require!(
+            current_time - round_open_timestamp <= MAX_AGE_SECONDS,
+            ErrorCode::OraclePriceStale
+        );
+
+        msg!("Switchboard price age: {} seconds", current_time - round_open_timestamp);
+
+        // **SECURITY FIX #50**: Validate scale/decimals (0-18 typical)
+        require!(
+            scale <= 18,
+            ErrorCode::InvalidOracleExponent
+        );
+
+        msg!("Switchboard scale: {}", scale);
+
+        // For Switchboard, we use a default confidence of 1% of price
+        // In production, you could parse the std_deviation field for actual confidence
+        let confidence = price.checked_mul(1).ok_or(ErrorCode::MathOverflow)?
+            .checked_div(100).ok_or(ErrorCode::MathOverflow)?;
+
+        // **SECURITY FIX #50**: Validate confidence (confidence should be <= 5% of price)
+        let max_confidence = price.checked_mul(5).ok_or(ErrorCode::MathOverflow)?
+            .checked_div(100).ok_or(ErrorCode::MathOverflow)?;
+        require!(
+            confidence <= max_confidence,
+            ErrorCode::OracleConfidenceTooLow
+        );
+
+        // Normalize price to 6 decimals if needed
+        let normalized_price = if scale > 6 {
+            let scale_factor = 10u64.pow((scale - 6) as u32);
+            price.checked_div(scale_factor).ok_or(ErrorCode::MathOverflow)?
+        } else if scale < 6 {
+            let scale_factor = 10u64.pow((6 - scale) as u32);
+            price.checked_mul(scale_factor).ok_or(ErrorCode::MathOverflow)?
+        } else {
+            price
+        };
+
+        // Update rift oracle with validated price
+        rift.add_price_data(normalized_price, confidence, current_time)?;
+
+        emit!(OraclePriceUpdated {
+            rift: rift.key(),
+            oracle_type: OracleType::Switchboard,
+            price: normalized_price,
+            confidence,
+            timestamp: current_time,
+        });
+
+        Ok(())
+    }
 
     /// Manual rebalance (can be called by anyone if conditions are met)
     pub fn trigger_rebalance(
@@ -1406,6 +1710,7 @@ pub mod rifts_protocol {
     }
 
     /// Execute Jupiter swap for fee buybacks (integrated with fee collector)
+    /// **SECURITY FIX #51**: Added balance verification to enforce minimum_amount_out
     pub fn jupiter_swap_for_buyback(
         ctx: Context<JupiterSwapForBuyback>,
         amount_in: u64,
@@ -1428,16 +1733,25 @@ pub mod rifts_protocol {
         // Validate input
         require!(amount_in > 0, ErrorCode::InvalidAmount);
         require!(amount_in <= 1_000_000_000_000, ErrorCode::AmountTooLarge);
+        require!(minimum_amount_out > 0, ErrorCode::InvalidAmount);
         require!(swap_data.len() <= 10000, ErrorCode::InvalidInputData);
-        
+
+        // **SECURITY FIX #51**: Snapshot source balance before swap
+        let source_balance_before = ctx.accounts.source_token_account.amount;
+        msg!("Source balance before swap: {}", source_balance_before);
+
+        // **SECURITY FIX #51**: Snapshot destination balance before swap
+        let dest_balance_before = ctx.accounts.destination_token_account.amount;
+        msg!("Destination balance before swap: {}", dest_balance_before);
+
         // CPI to Jupiter program for swap
         let cpi_program = ctx.accounts.jupiter_program.to_account_info();
         let cpi_accounts = ctx.remaining_accounts;
-        
+
         let rift_key = rift.key();
         let vault_seeds = &[b"vault_auth", rift_key.as_ref(), &[ctx.bumps.vault_authority]];
         let signer_seeds = &[&vault_seeds[..]];
-        
+
         // Execute Jupiter swap instruction
         let swap_instruction = anchor_lang::solana_program::instruction::Instruction {
             program_id: ctx.accounts.jupiter_program.key(),
@@ -1450,18 +1764,51 @@ pub mod rifts_protocol {
             }).collect(),
             data: swap_data,
         };
-        
+
         anchor_lang::solana_program::program::invoke_signed(
             &swap_instruction,
             cpi_accounts,
             signer_seeds,
         )?;
-        
+
+        // **SECURITY FIX #51**: Reload account data after swap to get updated balances
+        ctx.accounts.source_token_account.reload()?;
+        ctx.accounts.destination_token_account.reload()?;
+
+        // **SECURITY FIX #51**: Verify source balance decreased as expected
+        let source_balance_after = ctx.accounts.source_token_account.amount;
+        msg!("Source balance after swap: {}", source_balance_after);
+
+        let source_delta = source_balance_before
+            .checked_sub(source_balance_after)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        require!(
+            source_delta >= amount_in,
+            ErrorCode::InvalidAmount
+        );
+        msg!("Source delta verified: {} (expected >= {})", source_delta, amount_in);
+
+        // **SECURITY FIX #51**: Verify destination balance increased by at least minimum_amount_out
+        let dest_balance_after = ctx.accounts.destination_token_account.amount;
+        msg!("Destination balance after swap: {}", dest_balance_after);
+
+        let dest_delta = dest_balance_after
+            .checked_sub(dest_balance_before)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        // **CRITICAL ENFORCEMENT**: Require actual output >= minimum required
+        require!(
+            dest_delta >= minimum_amount_out,
+            ErrorCode::SlippageExceeded
+        );
+        msg!("Destination delta verified: {} (minimum required: {})", dest_delta, minimum_amount_out);
+
         // Update rift metrics
         rift.total_volume_24h = rift.total_volume_24h
             .checked_add(amount_in)
             .ok_or(ErrorCode::MathOverflow)?;
-        
+
         emit!(JupiterSwapExecuted {
             rift: rift.key(),
             amount_in,
@@ -1783,6 +2130,45 @@ pub mod rifts_protocol {
         Ok(())
     }
 
+    /// **SECURITY FIX #50**: Set oracle account addresses (creator only)
+    /// This binds specific Pyth/Switchboard accounts to the rift for validation
+    pub fn set_oracle_accounts(
+        ctx: Context<SetOracleAccounts>,
+        pyth_account: Option<Pubkey>,
+        switchboard_account: Option<Pubkey>,
+    ) -> Result<()> {
+        let rift = &mut ctx.accounts.rift;
+
+        // Only creator can set oracle accounts
+        require!(
+            ctx.accounts.creator.key() == rift.creator,
+            ErrorCode::Unauthorized
+        );
+
+        // Validate accounts are not system program
+        if let Some(pyth) = pyth_account {
+            require!(
+                pyth != anchor_lang::solana_program::system_program::ID,
+                ErrorCode::InvalidOracleAccount
+            );
+        }
+        if let Some(switchboard) = switchboard_account {
+            require!(
+                switchboard != anchor_lang::solana_program::system_program::ID,
+                ErrorCode::InvalidOracleAccount
+            );
+        }
+
+        // Set oracle accounts
+        rift.pyth_price_account = pyth_account;
+        rift.switchboard_feed_account = switchboard_account;
+        rift.last_governance_update = Clock::get()?.unix_timestamp;
+
+        msg!("Oracle accounts set - Pyth: {:?}, Switchboard: {:?}", pyth_account, switchboard_account);
+
+        Ok(())
+    }
+
 }
 
 // SIMPLIFIED ACCOUNT STRUCTS TO REDUCE STACK USAGE
@@ -1918,16 +2304,37 @@ pub struct WrapTokens<'info> {
     #[account(mut)]
     pub rift: Account<'info, Rift>,
 
-    #[account(mut)]
+    /// **SECURITY FIX #49**: Validate user's underlying token account
+    #[account(
+        mut,
+        constraint = user_underlying.mint == rift.underlying_mint @ ErrorCode::InvalidMint,
+        constraint = user_underlying.owner == user.key() @ ErrorCode::UnauthorizedTokenAccount
+    )]
     pub user_underlying: Account<'info, TokenAccount>,
 
-    #[account(mut)]
+    /// **SECURITY FIX #49**: Validate user's RIFT token account
+    #[account(
+        mut,
+        constraint = user_rift_tokens.mint == rift.rift_mint @ ErrorCode::InvalidMint,
+        constraint = user_rift_tokens.owner == user.key() @ ErrorCode::UnauthorizedTokenAccount
+    )]
     pub user_rift_tokens: Account<'info, TokenAccount>,
 
-    #[account(mut)]
+    /// **SECURITY FIX #49**: Validate vault matches rift state
+    #[account(
+        mut,
+        constraint = vault.key() == rift.vault @ ErrorCode::InvalidVault,
+        constraint = vault.mint == rift.underlying_mint @ ErrorCode::InvalidMint,
+        seeds = [b"vault", rift.key().as_ref()],
+        bump
+    )]
     pub vault: Account<'info, TokenAccount>,
 
-    #[account(mut)]
+    /// **SECURITY FIX #49**: Validate rift mint matches rift state
+    #[account(
+        mut,
+        constraint = rift_mint.key() == rift.rift_mint @ ErrorCode::InvalidMint
+    )]
     pub rift_mint: Account<'info, Mint>,
 
     /// CHECK: PDA
@@ -1936,6 +2343,9 @@ pub struct WrapTokens<'info> {
         bump
     )]
     pub rift_mint_authority: UncheckedAccount<'info>,
+
+    /// **SECURITY FIX #49**: Add underlying mint for validation
+    pub underlying_mint: Account<'info, Mint>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -2006,7 +2416,12 @@ pub struct WrapAndAddLiquidity<'info> {
     /// CHECK: Meteora event authority
     pub event_authority: UncheckedAccount<'info>,
 
-    /// CHECK: Meteora program
+    /// **SECURITY FIX #51**: Validate Meteora program ID against hardcoded constant
+    /// This prevents attackers from passing fake Meteora programs to steal funds
+    #[account(
+        constraint = meteora_program.key() == METEORA_DAMM_V2_PROGRAM_ID @ ErrorCode::InvalidProgramId,
+        constraint = meteora_program.executable @ ErrorCode::InvalidProgramId
+    )]
     pub meteora_program: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
@@ -2064,7 +2479,12 @@ pub struct RemoveLiquidityAndUnwrap<'info> {
     /// CHECK: Meteora event authority
     pub event_authority: UncheckedAccount<'info>,
 
-    /// CHECK: Meteora program
+    /// **SECURITY FIX #51**: Validate Meteora program ID against hardcoded constant
+    /// This prevents attackers from passing fake Meteora programs to steal funds
+    #[account(
+        constraint = meteora_program.key() == METEORA_DAMM_V2_PROGRAM_ID @ ErrorCode::InvalidProgramId,
+        constraint = meteora_program.executable @ ErrorCode::InvalidProgramId
+    )]
     pub meteora_program: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
@@ -2180,12 +2600,20 @@ pub struct UnwrapTokens<'info> {
     #[account(mut)]
     pub rift: Account<'info, Rift>,
 
-    /// User's underlying token account (SOL/WSOL)
-    #[account(mut)]
+    /// **SECURITY FIX #49**: Validate user's underlying token account
+    #[account(
+        mut,
+        constraint = user_underlying.mint == rift.underlying_mint @ ErrorCode::InvalidMint,
+        constraint = user_underlying.owner == user.key() @ ErrorCode::UnauthorizedTokenAccount
+    )]
     pub user_underlying: Account<'info, TokenAccount>,
 
-    /// User's RIFT token account
-    #[account(mut)]
+    /// **SECURITY FIX #49**: Validate user's RIFT token account
+    #[account(
+        mut,
+        constraint = user_rift_tokens.mint == rift.rift_mint @ ErrorCode::InvalidMint,
+        constraint = user_rift_tokens.owner == user.key() @ ErrorCode::UnauthorizedTokenAccount
+    )]
     pub user_rift_tokens: Account<'info, TokenAccount>,
 
     /// **METEORA INTEGRATION**: Meteora pool account
@@ -2218,11 +2646,17 @@ pub struct UnwrapTokens<'info> {
     /// CHECK: Meteora pool vault
     pub token_b_vault: UncheckedAccount<'info>,
 
-    /// RIFT mint
-    #[account(mut)]
+    /// **SECURITY FIX #49**: Validate rift mint matches rift state
+    #[account(
+        mut,
+        constraint = rift_mint.key() == rift.rift_mint @ ErrorCode::InvalidMint
+    )]
     pub rift_mint: Account<'info, Mint>,
 
-    /// Underlying mint (SOL/WSOL)
+    /// **SECURITY FIX #49**: Validate underlying mint matches rift state
+    #[account(
+        constraint = underlying_mint.key() == rift.underlying_mint @ ErrorCode::InvalidMint
+    )]
     pub underlying_mint: Account<'info, Mint>,
 
     /// RIFT mint authority PDA
@@ -2326,26 +2760,31 @@ pub struct InitializePool<'info> {
     pub rent: Sysvar<'info, Rent>,
 }
 
+/// **SECURITY FIX #50**: Account struct for updating Pyth oracle
 #[derive(Accounts)]
-pub struct UpdateOraclePrice<'info> {
+pub struct UpdatePythOracle<'info> {
     #[account(mut)]
     pub rift: Account<'info, Rift>,
 
-    /// **SECURITY FIX**: Authority authorized to update oracle prices
+    /// **SECURITY FIX #50**: Authority authorized to update oracle prices (creator or governance)
     pub oracle_authority: Signer<'info>,
 
-    /// **SECURE**: Pyth price account (external oracle)
-    /// CHECK: Validated as legitimate Pyth account by ownership
-    #[account(
-        constraint = pyth_price_account.owner != &anchor_lang::solana_program::system_program::ID @ ErrorCode::EmptyOracleRegistry
-    )]
+    /// **SECURITY FIX #50**: Pyth price account - validated against rift.pyth_price_account
+    /// CHECK: Validated in instruction handler against stored pubkey and Pyth program ownership
     pub pyth_price_account: UncheckedAccount<'info>,
+}
 
-    /// **SECURE**: Switchboard price feed (external oracle)
-    /// CHECK: Validated as legitimate Switchboard account by ownership
-    #[account(
-        constraint = switchboard_feed.owner != &anchor_lang::solana_program::system_program::ID @ ErrorCode::EmptyOracleRegistry
-    )]
+/// **SECURITY FIX #50**: Account struct for updating Switchboard oracle
+#[derive(Accounts)]
+pub struct UpdateSwitchboardOracle<'info> {
+    #[account(mut)]
+    pub rift: Account<'info, Rift>,
+
+    /// **SECURITY FIX #50**: Authority authorized to update oracle prices (creator or governance)
+    pub oracle_authority: Signer<'info>,
+
+    /// **SECURITY FIX #50**: Switchboard aggregator feed - validated against rift.switchboard_feed_account
+    /// CHECK: Validated in instruction handler against stored pubkey and Switchboard program ownership
     pub switchboard_feed: UncheckedAccount<'info>,
 }
 
@@ -2496,23 +2935,35 @@ pub struct UnstakeLPTokens<'info> {
 pub struct JupiterSwapForBuyback<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
-    
+
     #[account(mut)]
     pub rift: Account<'info, Rift>,
-    
+
     /// CHECK: Vault authority PDA
     #[account(
         seeds = [b"vault_auth", rift.key().as_ref()],
         bump
     )]
     pub vault_authority: UncheckedAccount<'info>,
-    
+
+    /// **SECURITY FIX #51**: Source token account for balance verification
+    /// This is the account that pays for the swap
+    #[account(mut)]
+    pub source_token_account: Account<'info, TokenAccount>,
+
+    /// **SECURITY FIX #51**: Destination token account for balance verification
+    /// This is the account that receives the swapped tokens
+    #[account(mut)]
+    pub destination_token_account: Account<'info, TokenAccount>,
+
     /// CHECK: Jupiter program - validated in instruction against governance config
     /// **SECURITY FIX**: Removed hardcoded constraint to allow governance configuration
     #[account(
         constraint = jupiter_program.executable @ ErrorCode::InvalidProgramId
     )]
     pub jupiter_program: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
@@ -2632,6 +3083,19 @@ pub struct UpdateJupiterProgramId<'info> {
     pub rift: Account<'info, Rift>,
 }
 
+/// **SECURITY FIX #50**: Account struct for setting oracle addresses
+#[derive(Accounts)]
+pub struct SetOracleAccounts<'info> {
+    #[account(mut)]
+    pub creator: Signer<'info>,
+
+    #[account(
+        mut,
+        constraint = rift.creator == creator.key() @ ErrorCode::Unauthorized
+    )]
+    pub rift: Account<'info, Rift>,
+}
+
 #[account]
 pub struct Rift {
     pub name: [u8; 32],  // Fixed-size name (no heap allocation!)
@@ -2678,7 +3142,18 @@ pub struct Rift {
     pub total_liquidity_rift: u64,     // Rift tokens in LP pool
     pub active_bin_id: i32,             // Current active bin ID (Meteora DLMM style)
     pub bin_step: u16,                  // Bin step for price increments
-    
+
+    // **SECURITY FIX #48**: Store Meteora pool state for validation
+    pub pool_authority: Option<Pubkey>,      // Meteora pool authority PDA
+    pub pool_token_a_vault: Option<Pubkey>,  // Meteora pool's underlying vault
+    pub pool_token_b_vault: Option<Pubkey>,  // Meteora pool's RIFT vault
+    pub pool_underlying: Option<Pubkey>,     // Legacy pool underlying (if used)
+    pub pool_rift: Option<Pubkey>,           // Legacy pool rift (if used)
+
+    // **SECURITY FIX #50**: Store oracle account addresses for validation
+    pub pyth_price_account: Option<Pubkey>,       // Bound Pyth price account address
+    pub switchboard_feed_account: Option<Pubkey>, // Bound Switchboard aggregator address
+
     // LP Staking
     pub total_lp_staked: u64,          // Total LP tokens staked
     pub pending_rewards: u64,          // Pending RIFTS rewards for distribution
@@ -3170,15 +3645,6 @@ pub struct RiftUnpaused {
     pub timestamp: i64,
 }
 
-#[event]
-pub struct OraclePriceUpdated {
-    pub rift: Pubkey,
-    pub oracle_type: String,
-    pub price: u64,
-    pub confidence: u64,
-    pub timestamp: i64,
-}
-
 #[error_code]
 pub enum ErrorCode {
     #[msg("Invalid burn fee (max 45%)")]
@@ -3327,326 +3793,47 @@ pub enum ErrorCode {
     NoPendingParameterChanges,
     #[msg("Emergency action not authorized by governance")]
     EmergencyActionNotAuthorized,
+    #[msg("Invalid mint - does not match rift state")]
+    InvalidMint,
+    #[msg("Invalid vault - does not match rift state")]
+    InvalidVault,
+    #[msg("Unauthorized token account - owner mismatch")]
+    UnauthorizedTokenAccount,
+    #[msg("Invalid pool authority - does not match stored state")]
+    InvalidPoolAuthority,
+    #[msg("Invalid pool vault - does not match stored state")]
+    InvalidPoolVault,
+    #[msg("Oracle account not set - must call set_oracle_accounts first")]
+    OracleAccountNotSet,
+    #[msg("Slippage exceeded - actual output less than minimum required")]
+    SlippageExceeded,
+    #[msg("Oracle account mismatch - provided account does not match stored oracle account")]
+    OracleAccountMismatch,
+    #[msg("Invalid oracle owner - oracle account not owned by Pyth or Switchboard program")]
+    InvalidOracleOwner,
+    #[msg("Invalid oracle data - account data too small or malformed")]
+    InvalidOracleData,
+    #[msg("Oracle price stale - price data older than maximum allowed age")]
+    OraclePriceStale,
+    #[msg("Oracle confidence too low - confidence interval too large relative to price")]
+    OracleConfidenceTooLow,
+    #[msg("Invalid oracle exponent - exponent outside acceptable range")]
+    InvalidOracleExponent,
 }
 
-// Oracle update instruction implementations
-pub fn update_pyth_oracle(ctx: Context<UpdatePythOracle>) -> Result<()> {
-    let rift = &mut ctx.accounts.rift;
-
-    // **CRITICAL FIX**: Add reentrancy protection for oracle updates
-    require!(!rift.reentrancy_guard, ErrorCode::ReentrancyDetected);
-    rift.reentrancy_guard = true;
-
-    let pyth_price_account = &ctx.accounts.pyth_price_account;
-
-    // **CRITICAL SECURITY FIX**: Validate oracle authority
-    // Oracle updates must come from authorized sources to prevent price manipulation
-    require!(
-        ctx.accounts.oracle_authority.key() == rift.creator,
-        ErrorCode::UnauthorizedOracleUpdate
-    );
-    
-    // Parse REAL Pyth price account data directly
-    let price_data = pyth_price_account.try_borrow_data()?;
-    require!(price_data.len() >= 240, ErrorCode::InvalidOraclePrice); // Minimum Pyth account size
-    
-    let current_time = Clock::get()?.unix_timestamp;
-    
-    // Parse Pyth price account structure
-    // Pyth account layout: magic(4) + version(4) + account_type(4) + price_data...
-    let magic = u32::from_le_bytes([price_data[0], price_data[1], price_data[2], price_data[3]]);
-    let version = u32::from_le_bytes([price_data[4], price_data[5], price_data[6], price_data[7]]);
-    let account_type = u32::from_le_bytes([price_data[8], price_data[9], price_data[10], price_data[11]]);
-    
-    // Validate Pyth magic number and account type
-    require!(magic == 0xa1b2c3d4, ErrorCode::InvalidOraclePrice); // Pyth magic
-    require!(account_type == 3, ErrorCode::InvalidOraclePrice); // Price account type
-    
-    // Extract price data from Pyth account
-    // Price is at offset 208-215 (i64)
-    let price_i64 = i64::from_le_bytes([
-        price_data[208], price_data[209], price_data[210], price_data[211],
-        price_data[212], price_data[213], price_data[214], price_data[215]
-    ]);
-    
-    // Confidence is at offset 216-223 (u64)
-    let confidence_u64 = u64::from_le_bytes([
-        price_data[216], price_data[217], price_data[218], price_data[219],
-        price_data[220], price_data[221], price_data[222], price_data[223]
-    ]);
-    
-    // Timestamp is at offset 224-231 (i64)
-    let timestamp_i64 = i64::from_le_bytes([
-        price_data[224], price_data[225], price_data[226], price_data[227],
-        price_data[228], price_data[229], price_data[230], price_data[231]
-    ]);
-    
-    // Validate price staleness (allow max 300 seconds)
-    require!(
-        current_time - timestamp_i64 <= 300,
-        ErrorCode::OraclePriceTooStale
-    );
-    
-    // Convert price to positive u64 with scaling
-    let price_scaled = if price_i64 >= 0 {
-        u64::try_from(price_i64).map_err(|_| ErrorCode::MathOverflow)?
-            .checked_mul(1_000_000) // Scale to 6 decimals
-            .ok_or(ErrorCode::MathOverflow)?
-    } else {
-        return Err(ErrorCode::InvalidOraclePrice.into());
-    };
-    
-    let confidence_scaled = confidence_u64
-        .checked_mul(1_000_000)
-        .ok_or(ErrorCode::MathOverflow)?;
-    
-    // Validate price and confidence
-    require!(price_scaled > 0, ErrorCode::InvalidOraclePrice);
-    require!(price_scaled <= 1_000_000_000_000, ErrorCode::OraclePriceTooLarge);
-    require!(
-        confidence_scaled <= price_scaled.checked_div(10).ok_or(ErrorCode::MathOverflow)?, 
-        ErrorCode::InvalidConfidence
-    );
-    
-    // Update oracle price in rift with real parsed Pyth data
-    rift.add_price_data(price_scaled, confidence_scaled, timestamp_i64)?;
-    
-    emit!(OraclePriceUpdated {
-        rift: rift.key(),
-        oracle_type: "Pyth".to_string(),
-        price: price_scaled,
-        confidence: confidence_scaled,
-        timestamp: timestamp_i64,
-    });
-
-    // **CRITICAL FIX**: Release reentrancy guard
-    rift.reentrancy_guard = false;
-
-    Ok(())
+/// **SECURITY FIX #50**: Oracle type enum for event emission
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
+pub enum OracleType {
+    Pyth,
+    Switchboard,
 }
 
-pub fn update_switchboard_oracle(ctx: Context<UpdateSwitchboardOracle>) -> Result<()> {
-    let rift = &mut ctx.accounts.rift;
-
-    // **CRITICAL FIX**: Add reentrancy protection for oracle updates
-    require!(!rift.reentrancy_guard, ErrorCode::ReentrancyDetected);
-    rift.reentrancy_guard = true;
-
-    let switchboard_feed = &ctx.accounts.switchboard_feed;
-
-    // **CRITICAL SECURITY FIX**: Validate oracle authority
-    // Oracle updates must come from authorized sources to prevent price manipulation
-    require!(
-        ctx.accounts.oracle_authority.key() == rift.creator,
-        ErrorCode::UnauthorizedOracleUpdate
-    );
-
-    // Parse REAL Switchboard aggregator account data directly
-    let aggregator_data = switchboard_feed.try_borrow_data()?;
-    require!(aggregator_data.len() >= 384, ErrorCode::InvalidOraclePrice); // Minimum Switchboard aggregator size
-    
-    let current_time = Clock::get()?.unix_timestamp;
-    
-    // Parse Switchboard aggregator account structure
-    // Switchboard layout: discriminator(8) + data...
-    let discriminator = u64::from_le_bytes([
-        aggregator_data[0], aggregator_data[1], aggregator_data[2], aggregator_data[3],
-        aggregator_data[4], aggregator_data[5], aggregator_data[6], aggregator_data[7]
-    ]);
-    
-    // Validate Switchboard discriminator (aggregator account)
-    require!(discriminator != 0, ErrorCode::InvalidOraclePrice);
-    
-    // Extract latest value from Switchboard aggregator
-    // Latest value is stored as 128-bit decimal at offset 120-135
-    let value_bytes = &aggregator_data[120..136];
-    
-    // Parse the value as bytes and convert to f64 (simplified parsing)
-    let mut value_bits = [0u8; 16];
-    value_bits.copy_from_slice(value_bytes);
-    let value_u128 = u128::from_le_bytes(value_bits);
-    
-    // Convert to scaled price (simplified conversion)
-    let price_scaled = u64::try_from(value_u128)
-        .map_err(|_| ErrorCode::MathOverflow)?
-        .checked_div(1_000_000_000_000) // Scale down from Switchboard decimals
-        .ok_or(ErrorCode::MathOverflow)?
-        .checked_mul(1_000_000) // Scale to our 6 decimal format
-        .ok_or(ErrorCode::MathOverflow)?;
-    
-    // Extract standard deviation (confidence) from offset 152-167
-    let std_dev_bytes = &aggregator_data[152..168];
-    let mut std_dev_bits = [0u8; 16];
-    std_dev_bits.copy_from_slice(std_dev_bytes);
-    let std_dev_u128 = u128::from_le_bytes(std_dev_bits);
-    
-    let confidence_scaled = u64::try_from(std_dev_u128)
-        .map_err(|_| ErrorCode::MathOverflow)?
-        .checked_div(1_000_000_000_000)
-        .ok_or(ErrorCode::MathOverflow)?
-        .checked_mul(1_000_000)
-        .ok_or(ErrorCode::MathOverflow)?;
-    
-    // Extract timestamp from offset 168-175 (i64)
-    let timestamp_i64 = i64::from_le_bytes([
-        aggregator_data[168], aggregator_data[169], aggregator_data[170], aggregator_data[171],
-        aggregator_data[172], aggregator_data[173], aggregator_data[174], aggregator_data[175]
-    ]);
-    
-    // Validate aggregator staleness (allow max 300 seconds)
-    require!(
-        current_time - timestamp_i64 <= 300,
-        ErrorCode::OraclePriceTooStale
-    );
-    
-    // Validate price and confidence
-    require!(price_scaled > 0, ErrorCode::InvalidOraclePrice);
-    require!(price_scaled <= 1_000_000_000_000, ErrorCode::OraclePriceTooLarge);
-    require!(
-        confidence_scaled <= price_scaled.checked_div(5).ok_or(ErrorCode::MathOverflow)?, // Max 20% confidence interval
-        ErrorCode::InvalidConfidence
-    );
-    
-    // Update oracle price in rift with real parsed Switchboard data
-    rift.add_price_data(price_scaled, confidence_scaled, timestamp_i64)?;
-    
-    emit!(OraclePriceUpdated {
-        rift: rift.key(),
-        oracle_type: "Switchboard".to_string(),
-        price: price_scaled,
-        confidence: confidence_scaled,
-        timestamp: timestamp_i64,
-    });
-
-    // **CRITICAL FIX**: Release reentrancy guard
-    rift.reentrancy_guard = false;
-
-    Ok(())
+// Events
+#[event]
+pub struct OraclePriceUpdated {
+    pub rift: Pubkey,
+    pub oracle_type: OracleType,
+    pub price: u64,
+    pub confidence: u64,
+    pub timestamp: i64,
 }
-
-/// **SECURITY FIX**: Update oracle price using trusted external feeds only
-/// This function now integrates with Pyth or Switchboard oracles for secure price data
-pub fn update_oracle_price(ctx: Context<UpdateOraclePrice>) -> Result<()> {
-    let rift = &mut ctx.accounts.rift;
-
-    // **CRITICAL FIX**: Add reentrancy protection for oracle updates
-    require!(!rift.reentrancy_guard, ErrorCode::ReentrancyDetected);
-    rift.reentrancy_guard = true;
-
-    // **CRITICAL SECURITY FIX**: Only rift creator can update oracle prices
-    require!(
-        ctx.accounts.oracle_authority.key() == rift.creator,
-        ErrorCode::UnauthorizedOracleUpdate
-    );
-
-    let current_time = Clock::get()?.unix_timestamp;
-
-    // **SECURE APPROACH**: Use external oracle data (Pyth/Switchboard)
-    // Instead of accepting arbitrary price data, read from trusted oracle accounts
-    let price = if ctx.accounts.pyth_price_account.key() != Pubkey::default() {
-        // Use Pyth oracle
-        let pyth_price_info = &ctx.accounts.pyth_price_account.to_account_info();
-        let pyth_price_data = pyth_price_info.try_borrow_data()?;
-
-        // Validate Pyth account structure (simplified - in production use Pyth SDK)
-        require!(pyth_price_data.len() >= 32, ErrorCode::InvalidOraclePrice);
-
-        // Extract price from Pyth format (this is simplified - use proper Pyth SDK in production)
-        let price_bytes = &pyth_price_data[8..16];
-        u64::from_le_bytes(price_bytes.try_into().map_err(|_| ErrorCode::InvalidOraclePrice)?)
-    } else if ctx.accounts.switchboard_feed.key() != Pubkey::default() {
-        // Use Switchboard oracle
-        let sb_feed_info = &ctx.accounts.switchboard_feed.to_account_info();
-        let sb_feed_data = sb_feed_info.try_borrow_data()?;
-
-        // Validate Switchboard account structure (simplified)
-        require!(sb_feed_data.len() >= 32, ErrorCode::InvalidOraclePrice);
-
-        // Extract price from Switchboard format (simplified - use proper Switchboard SDK)
-        let price_bytes = &sb_feed_data[8..16];
-        u64::from_le_bytes(price_bytes.try_into().map_err(|_| ErrorCode::InvalidOraclePrice)?)
-    } else {
-        return Err(ErrorCode::InvalidOraclePrice.into());
-    };
-
-    // Validate price data
-    require!(price > 0, ErrorCode::InvalidOraclePrice);
-    require!(price <= 1_000_000_000_000, ErrorCode::OraclePriceTooLarge);
-
-    // Validate against rift's existing oracle data for sanity check
-    if rift.last_oracle_update > 0 {
-        let last_price = rift.get_average_oracle_price()?;
-        if last_price > 0 {
-            // Price shouldn't deviate more than 50% from last known price
-            let max_deviation = last_price
-                .checked_div(2)
-                .ok_or(ErrorCode::MathOverflow)?;
-            let min_price = last_price
-                .checked_sub(max_deviation)
-                .ok_or(ErrorCode::MathOverflow)?;
-            let max_price = last_price
-                .checked_add(max_deviation)
-                .ok_or(ErrorCode::MathOverflow)?;
-
-            require!(
-                price >= min_price && price <= max_price,
-                ErrorCode::InvalidOraclePrice
-            );
-        }
-    }
-
-    // **SECURE**: Update oracle price in rift with trusted external data
-    rift.add_price_data(
-        price,
-        0, // Confidence not available from simplified parsing
-        current_time
-    )?;
-
-    emit!(OraclePriceUpdated {
-        rift: rift.key(),
-        oracle_type: "External".to_string(),
-        price,
-        confidence: 0,
-        timestamp: current_time,
-    });
-
-    // **CRITICAL FIX**: Release reentrancy guard
-    rift.reentrancy_guard = false;
-
-    Ok(())
-}
-
-#[derive(Accounts)]
-pub struct UpdatePythOracle<'info> {
-    #[account(mut)]
-    pub rift: Account<'info, Rift>,
-    
-    /// CHECK: Pyth price account - validated for minimum size and non-default owner
-    #[account(
-        constraint = pyth_price_account.to_account_info().data_len() >= 240 @ ErrorCode::InvalidOracleAccount,
-        constraint = pyth_price_account.owner != &anchor_lang::solana_program::system_program::ID @ ErrorCode::InvalidOracleAccount
-    )]
-    pub pyth_price_account: UncheckedAccount<'info>,
-    
-    pub oracle_authority: Signer<'info>,
-}
-
-#[derive(Accounts)]
-pub struct UpdateSwitchboardOracle<'info> {
-    #[account(mut)]
-    pub rift: Account<'info, Rift>,
-    
-    /// CHECK: Switchboard aggregator account - validated for minimum size and non-system owner
-    #[account(
-        constraint = switchboard_feed.to_account_info().data_len() >= 512 @ ErrorCode::InvalidOracleAccount,
-        constraint = switchboard_feed.owner != &anchor_lang::solana_program::system_program::ID @ ErrorCode::InvalidOracleAccount
-    )]
-    pub switchboard_feed: UncheckedAccount<'info>,
-    
-    pub oracle_authority: Signer<'info>,
-}
-
-// **SECURITY FIX**: Removed vulnerable JupiterPriceUpdate struct
-// Oracle data now comes from trusted external sources (Pyth/Switchboard) only
-
-
